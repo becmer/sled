@@ -24,7 +24,6 @@
 
 use std::collections::HashMap;
 
-use crate::pagecache::DiskPtr;
 use crate::*;
 
 use crate::stack::{Iter as StackIter, Stack};

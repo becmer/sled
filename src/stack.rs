@@ -140,7 +140,7 @@ impl<T: Send + Sync + 'static> Stack<T> {
             match unsafe { head.as_ref() } {
                 Some(h) => {
                     let next = h.next.load(Acquire, guard);
-                    match self.head.compare_and_set(head, next, Release, guard)
+                    match self.head.compare_exchange(head, next, Release, Relaxed, guard)
                     {
                         Ok(_) => unsafe {
                             // we unset the next pointer before destruction

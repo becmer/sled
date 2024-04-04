@@ -238,7 +238,7 @@ impl Default for Inner {
             idgen_persist_interval: 1_000_000,
             global_error: Arc::new(Atomic::default()),
             #[cfg(feature = "event_log")]
-            event_log: Arc::new(crate::event_log::EventLog::default()),
+            event_log: Arc::new(event_log::EventLog::default()),
         }
     }
 }
@@ -773,7 +773,7 @@ impl Config {
     pub fn truncate_corrupt(&self, new_len: u64) {
         self.event_log.reset();
         let path = self.db_path();
-        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_len(new_len).expect("should be able to truncate");
     }
 }
