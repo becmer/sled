@@ -1,8 +1,6 @@
 use std::thread;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
-
 use super::*;
 
 #[derive(Debug, Clone, Copy)]

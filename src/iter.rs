@@ -1,7 +1,5 @@
 use std::ops::{Bound, Deref};
 
-use crate::{Measure, M};
-
 use super::*;
 
 #[cfg(any(test, feature = "lock_free_delays"))]

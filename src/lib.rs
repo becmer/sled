@@ -93,7 +93,8 @@
     trivial_numeric_casts,
     unsafe_code,
     unused_qualifications,
-    deprecated
+    unused_imports,
+    deprecated,
 )]
 #![deny(
     // over time, consider enabling the commented-out lints below

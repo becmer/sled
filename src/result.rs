@@ -1,5 +1,4 @@
 use std::{
-    cmp::PartialEq,
     error::Error as StdError,
     fmt::{self, Display},
     io,

@@ -1,8 +1,6 @@
 #![allow(unused_results)]
 #![allow(clippy::print_stdout)]
 
-use std::sync::atomic::AtomicUsize;
-
 #[cfg(not(target_arch = "x86_64"))]
 use std::time::{Duration, Instant};
 
@@ -11,8 +9,6 @@ use std::marker::PhantomData;
 
 #[cfg(not(feature = "no_metrics"))]
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
-
-use crate::Lazy;
 
 use super::*;
 

@@ -1,16 +1,14 @@
 use std::{
     num::NonZeroU64,
     borrow::Cow,
-    fmt::{self, Debug},
+    fmt::Debug,
     ops::{self, Deref, RangeBounds},
-    sync::atomic::Ordering::SeqCst,
 };
 
-use parking_lot::RwLock;
-
-use crate::{atomic_shim::AtomicU64, pagecache::NodeView, *};
+use crate::{pagecache::NodeView, *};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) struct View<'g> {
     pub node_view: NodeView<'g>,
     pub pid: PageId,

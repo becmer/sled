@@ -153,7 +153,7 @@ impl<T: ?Sized> Drop for Arc<T> {
             let rc = (*self.ptr).rc.fetch_sub(1, Ordering::Release) - 1;
             if rc == 0 {
                 std::sync::atomic::fence(Ordering::Acquire);
-                Box::from_raw(self.ptr);
+                let _ = Box::from_raw(self.ptr);
             }
         }
     }

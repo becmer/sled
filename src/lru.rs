@@ -134,7 +134,7 @@ impl Drop for AccessQueue {
         debug_delay();
         let writing = self.writing.load(Ordering::Acquire);
         unsafe {
-            Box::from_raw(writing);
+            let _ = Box::from_raw(writing);
         }
         debug_delay();
         let mut head = self.full_list.load(Ordering::Acquire);
@@ -143,7 +143,7 @@ impl Drop for AccessQueue {
                 debug_delay();
                 let next =
                     (*head).next.swap(ptr::null_mut(), Ordering::Release);
-                Box::from_raw(head);
+                let _ = Box::from_raw(head);
                 head = next;
             }
         }

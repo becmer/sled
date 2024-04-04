@@ -5,8 +5,7 @@ use crate::*;
 
 use super::{
     arr_to_u32, gc_blobs, pwrite_all, raw_segment_iter_from, u32_to_arr,
-    u64_to_arr, BasedBuf, DiskPtr, LogIter, LogKind, LogOffset, Lsn,
-    MessageKind,
+    u64_to_arr, BasedBuf, LogIter, MessageKind,
 };
 
 /// A snapshot of the state required to quickly restart

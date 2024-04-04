@@ -3,13 +3,12 @@ use std::{
     fs,
     fs::File,
     io,
-    io::{BufRead, BufReader, ErrorKind, Read, Seek, Write},
+    io::{BufRead, BufReader, ErrorKind, Seek},
     ops::Deref,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
 };
 
-use crate::pagecache::{arr_to_u32, u32_to_arr, Lsn};
+use crate::pagecache::{arr_to_u32, u32_to_arr};
 use crate::*;
 
 const DEFAULT_PATH: &str = "default.sled";

@@ -1,4 +1,4 @@
-use super::{BlobPointer, LogOffset};
+use super::BlobPointer;
 use crate::*;
 
 /// A pointer to a location on disk or an off-log blob.

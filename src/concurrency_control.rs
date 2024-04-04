@@ -31,6 +31,7 @@ fn init_cc() -> ConcurrencyControl {
 
 #[derive(Debug)]
 #[must_use]
+#[allow(dead_code)]
 pub(crate) enum Protector<'a> {
     Write(RwLockWriteGuard<'a, ()>),
     Read(RwLockReadGuard<'a, ()>),

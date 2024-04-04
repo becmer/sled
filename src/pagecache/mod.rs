@@ -58,8 +58,7 @@ pub(crate) use self::{
 
 pub use self::{
     constants::{
-        MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION, MINIMUM_ITEMS_PER_SEGMENT,
-        SEG_HEADER_LEN,
+        MAX_MSG_HEADER_LEN, SEG_HEADER_LEN,
     },
     disk_pointer::DiskPtr,
     logger::{Log, LogRead},
@@ -230,7 +229,7 @@ fn bump_atomic_lsn(atomic_lsn: &AtomicLsn, to: Lsn) {
     }
 }
 
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryInto;
 
 #[inline]
 pub(crate) fn lsn_to_arr(number: Lsn) -> [u8; 8] {
