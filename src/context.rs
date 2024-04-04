@@ -58,7 +58,7 @@ impl Context {
                     target_os = "netbsd",
                 )
             ))]
-            flusher: Arc::new(parking_lot::Mutex::new(None)),
+            flusher: Arc::new(Mutex::new(None)),
         })
     }
 

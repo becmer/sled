@@ -209,12 +209,12 @@ impl Tree {
             // success
             if let Some(res) = subscriber_reservation.take() {
                 let event = if let Some(value) = value.take() {
-                    subscriber::Event::Insert {
+                    Event::Insert {
                         key: key.as_ref().into(),
                         value,
                     }
                 } else {
-                    subscriber::Event::Remove { key: key.as_ref().into() }
+                    Event::Remove { key: key.as_ref().into() }
                 };
 
                 res.complete(&event);
@@ -577,12 +577,12 @@ impl Tree {
             if link.is_ok() {
                 if let Some(res) = subscriber_reservation.take() {
                     let event = if let Some(new) = new {
-                        subscriber::Event::Insert {
+                        Event::Insert {
                             key: key.as_ref().into(),
                             value: new,
                         }
                     } else {
-                        subscriber::Event::Remove { key: key.as_ref().into() }
+                        Event::Remove { key: key.as_ref().into() }
                     };
 
                     res.complete(&event);
@@ -1055,12 +1055,12 @@ impl Tree {
             if link.is_ok() {
                 if let Some(res) = subscriber_reservation.take() {
                     let event = if let Some(new) = &new {
-                        subscriber::Event::Insert {
+                        Event::Insert {
                             key: key.as_ref().into(),
                             value: new.clone(),
                         }
                     } else {
-                        subscriber::Event::Remove { key: key.as_ref().into() }
+                        Event::Remove { key: key.as_ref().into() }
                     };
 
                     res.complete(&event);
