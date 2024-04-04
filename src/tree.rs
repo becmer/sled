@@ -1549,8 +1549,9 @@ impl Tree {
             // 2 threads are at this point, and we don't want
             // to cause roots to diverge between meta and
             // our version.
-            while self.root.compare_and_swap(from, new_root_pid, SeqCst) != from
+            while self.root.compare_exchange(from, new_root_pid, SeqCst, SeqCst).is_err()
             {
+                std::hint::spin_loop();
             }
 
             Ok(true)

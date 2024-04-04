@@ -223,12 +223,10 @@ fn bump_atomic_lsn(atomic_lsn: &AtomicLsn, to: Lsn) {
         if current >= to {
             return;
         }
-        let last = atomic_lsn.compare_and_swap(current, to, SeqCst);
-        if last == current {
-            // we succeeded.
-            return;
+        match atomic_lsn.compare_exchange(current, to, SeqCst, SeqCst) {
+            Ok(_) => return,
+            Err(last) => current = last,
         }
-        current = last;
     }
 }
 
@@ -1087,7 +1085,7 @@ impl PageCache {
 
             debug_delay();
             let result =
-                old.entry.compare_and_set(old.read, page_ptr, SeqCst, guard);
+                old.entry.compare_exchange(old.read, page_ptr, SeqCst, SeqCst, guard);
 
             match result {
                 Ok(new_shared) => {
@@ -1277,9 +1275,10 @@ impl PageCache {
                 });
 
                 debug_delay();
-                let result = page_view.entry.compare_and_set(
+                let result = page_view.entry.compare_exchange(
                     page_view.read,
                     new_page,
+                    SeqCst,
                     SeqCst,
                     guard,
                 );
@@ -1519,7 +1518,7 @@ impl PageCache {
 
             debug_delay();
             let result =
-                old.entry.compare_and_set(old.read, page_ptr, SeqCst, guard);
+                old.entry.compare_exchange(old.read, page_ptr, SeqCst, SeqCst, guard);
 
             match result {
                 Ok(new_shared) => {
@@ -1744,9 +1743,10 @@ impl PageCache {
         });
 
         debug_delay();
-        let result = page_view.entry.compare_and_set(
+        let result = page_view.entry.compare_exchange(
             page_view.read,
             page,
+            SeqCst,
             SeqCst,
             guard,
         );
@@ -1944,9 +1944,10 @@ impl PageCache {
                     debug_delay();
                     if page_view
                         .entry
-                        .compare_and_set(
+                        .compare_exchange(
                             page_view.read,
                             new_page,
+                            SeqCst,
                             SeqCst,
                             guard,
                         )

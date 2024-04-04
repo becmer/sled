@@ -166,10 +166,11 @@ impl PageTable {
             let next_child = Node2::new();
 
             debug_delay();
-            let ret = l1[l1k].compare_and_set(
+            let ret = l1[l1k].compare_exchange(
                 Shared::null(),
                 next_child,
                 Release,
+                Relaxed,
                 guard,
             );
 

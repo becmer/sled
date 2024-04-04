@@ -758,9 +758,10 @@ impl Config {
 
         let expected_old = Shared::null();
 
-        let _ = self.global_error.compare_and_set(
+        let _ = self.global_error.compare_exchange(
             expected_old,
             error,
+            SeqCst,
             SeqCst,
             &guard,
         );

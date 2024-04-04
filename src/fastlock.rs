@@ -48,12 +48,8 @@ impl<T> FastLock<T> {
     }
 
     pub fn try_lock(&self) -> Option<FastLockGuard<'_, T>> {
-        let lock_result = self.lock.compare_and_swap(false, true, Acquire);
+        let lock_result = self.lock.compare_exchange(false, true, Acquire, Acquire);
 
-        // `compare_and_swap` returns the last value if successful,
-        // otherwise the current value. If we succeed, it should return false.
-        let success = !lock_result;
-
-        if success { Some(FastLockGuard { mu: self }) } else { None }
+        if lock_result.is_ok() { Some(FastLockGuard { mu: self }) } else { None }
     }
 }

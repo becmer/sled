@@ -82,7 +82,10 @@ impl AccessQueue {
                 let new = Box::into_raw(Box::new(AccessBlock::default()));
                 debug_delay();
                 let prev =
-                    self.writing.compare_and_swap(head, new, Ordering::Release);
+                    match self.writing.compare_exchange(head, new, Ordering::Release, Ordering::Relaxed) {
+                        Ok(prev) => prev,
+                        Err(prev) => prev,
+                    };
                 if prev != head {
                     // we lost the CAS, free the new item that was
                     // never published to other threads
@@ -100,11 +103,15 @@ impl AccessQueue {
                     // we loop because maybe other threads are pushing stuff too
                     block.next.store(full_list_ptr, Ordering::Release);
                     debug_delay();
-                    ret = self.full_list.compare_and_swap(
+                    ret = match self.full_list.compare_exchange(
                         full_list_ptr,
                         head,
                         Ordering::Release,
-                    );
+                        Ordering::Relaxed
+                    ) {
+                        Ok(prev) => prev,
+                        Err(prev) => prev,
+                    };
                     ret != full_list_ptr
                 } {
                     full_list_ptr = ret;
