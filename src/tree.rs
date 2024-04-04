@@ -1,9 +1,4 @@
-use std::{
-    num::NonZeroU64,
-    borrow::Cow,
-    fmt::Debug,
-    ops::{self, Deref, RangeBounds},
-};
+use std::{num::NonZeroU64, borrow::Cow, fmt::Debug, ops::{self, Deref, RangeBounds}};
 
 use crate::{pagecache::NodeView, *};
 
@@ -234,7 +229,7 @@ impl Tree {
     /// ```
     /// # use sled::{transaction::TransactionResult, Config};
     /// # fn main() -> TransactionResult<()> {
-    /// # let config = sled::Config::new().temporary(true);
+    /// # let config = Config::new().temporary(true);
     /// # let db = config.open()?;
     /// // Use write-only transactions as a writebatch:
     /// db.transaction(|tx_db| {
@@ -1277,9 +1272,9 @@ impl Tree {
         let mut upper = prefix_ref.to_vec();
 
         while let Some(last) = upper.pop() {
-            if last < u8::max_value() {
+            if last < u8::MAX {
                 upper.push(last + 1);
-                return self.range(prefix_ref..&upper);
+                return self.range(prefix_ref..upper.as_slice());
             }
         }
 
@@ -1607,7 +1602,7 @@ impl Tree {
         K: AsRef<[u8]>,
     {
         #[cfg(any(test, feature = "lock_free_delays"))]
-        const MAX_LOOPS: usize = usize::max_value();
+        const MAX_LOOPS: usize = usize::MAX;
 
         #[cfg(not(any(test, feature = "lock_free_delays")))]
         const MAX_LOOPS: usize = 1_000_000;
@@ -1637,7 +1632,7 @@ impl Tree {
         }
 
         for _ in 0..MAX_LOOPS {
-            if cursor == u64::max_value() {
+            if cursor == u64::MAX {
                 // this collection has been explicitly removed
                 return Err(Error::CollectionNotFound(self.tree_id.clone()));
             }

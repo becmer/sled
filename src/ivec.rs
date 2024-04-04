@@ -1,21 +1,18 @@
-use std::{
-    convert::TryFrom,
-    fmt,
-    hash::{Hash, Hasher},
-    iter::FromIterator,
-    ops::{Deref, DerefMut},
-};
+use std::{convert::TryFrom, fmt, hash::{Hash, Hasher}, iter::FromIterator, ops::{Deref, DerefMut}};
+use std::mem::ManuallyDrop;
 
 use crate::Arc;
 
 const CUTOFF: usize = 22;
 
-type Inner = [u8; CUTOFF];
+type InlineData = [u8; CUTOFF];
 
 /// A buffer that may either be inline or remote and protected
 /// by an Arc
-#[derive(Clone)]
-pub struct IVec(IVecInner);
+pub struct IVec {
+    data: Data,
+    state: State,
+}
 
 impl Default for IVec {
     fn default() -> Self {
@@ -23,11 +20,16 @@ impl Default for IVec {
     }
 }
 
+union Data {
+    inline: InlineData,
+    remote: ManuallyDrop<Arc<[u8]>>,
+}
+
 #[derive(Clone)]
-enum IVecInner {
-    Inline(u8, Inner),
-    Remote(Arc<[u8]>),
-    Subslice { base: Arc<[u8]>, offset: usize, len: usize },
+enum State {
+    Inline { len: u8 },
+    Remote,
+    Subslice { offset: usize, len: usize },
 }
 
 impl Hash for IVec {
@@ -41,6 +43,7 @@ const fn is_inline_candidate(length: usize) -> bool {
 }
 
 impl IVec {
+    #[allow(unsafe_code)]
     /// Create a subslice of this `IVec` that shares
     /// the same backing data and reference counter.
     ///
@@ -80,65 +83,112 @@ impl IVec {
     pub fn subslice(&self, slice_offset: usize, len: usize) -> Self {
         assert!(self.len().checked_sub(slice_offset).unwrap() >= len);
 
-        let inner = match self.0 {
-            IVecInner::Remote(ref base) => IVecInner::Subslice {
-                base: base.clone(),
-                offset: slice_offset,
-                len,
-            },
-            IVecInner::Inline(_, old_inner) => {
-                // old length already checked above in assertion
-                let mut new_inner = Inner::default();
-                new_inner[..len].copy_from_slice(
-                    &old_inner[slice_offset..slice_offset + len],
-                );
+        unsafe {
+            match self.state {
+                State::Remote => Self {
+                    data: self.data.clone_as_remote(),
+                    state: State::Subslice {
+                        offset: slice_offset,
+                        len,
+                    },
+                },
+                State::Inline { .. } => {
+                    // old length already checked above in assertion
+                    let mut inline = InlineData::default();
+                    inline[..len].copy_from_slice(
+                        &self.data.inline[slice_offset..slice_offset + len],
+                    );
 
-                IVecInner::Inline(u8::try_from(len).unwrap(), new_inner)
-            }
-            IVecInner::Subslice { ref base, ref offset, .. } => {
-                IVecInner::Subslice {
-                    base: base.clone(),
-                    offset: offset + slice_offset,
-                    len,
+                    Self {
+                        data: Data { inline },
+                        state: State::Inline { len: u8::try_from(len).unwrap() },
+                    }
+                }
+                State::Subslice { ref offset, .. } => Self {
+                    data: self.data.clone_as_remote(),
+                    state: State::Subslice {
+                        offset: offset + slice_offset,
+                        len,
+                    },
                 }
             }
-        };
-
-        IVec(inner)
+        }
     }
 
     fn inline(slice: &[u8]) -> Self {
         assert!(is_inline_candidate(slice.len()));
-        let mut data = Inner::default();
+        let mut data = InlineData::default();
         data[..slice.len()].copy_from_slice(slice);
-        Self(IVecInner::Inline(u8::try_from(slice.len()).unwrap(), data))
+        Self {
+            data: Data { inline: data },
+            state: State::Inline { len: u8::try_from(slice.len()).unwrap() },
+        }
     }
 
     fn remote(arc: Arc<[u8]>) -> Self {
-        Self(IVecInner::Remote(arc))
+        Self {
+            data: Data { remote: ManuallyDrop::new(arc) },
+            state: State::Remote,
+        }
     }
 
+    #[allow(unsafe_code)]
     fn make_mut(&mut self) {
-        match self.0 {
-            IVecInner::Remote(ref mut buf) if Arc::strong_count(buf) != 1 => {
-                self.0 = IVecInner::Remote(buf.to_vec().into());
+        unsafe {
+            match self.state {
+                State::Remote if self.data.strong_count() != 1 => {
+                    self.data = Data {
+                        remote: ManuallyDrop::new(self.data.remote.to_vec().into()),
+                    };
+                }
+                State::Subslice { offset, len } if self.data.strong_count() != 1 => {
+                    self.data = Data {
+                        remote: ManuallyDrop::new(self.data.remote[offset..offset + len].to_vec().into()),
+                    };
+                    self.state = State::Remote;
+                }
+                _ => {}
             }
-            IVecInner::Subslice { ref mut base, offset, len }
-                if Arc::strong_count(base) != 1 =>
-            {
-                self.0 = IVecInner::Remote(
-                    base[offset..offset + len].to_vec().into(),
-                );
-            }
-            _ => {}
         }
+    }
+}
+
+impl Clone for IVec {
+    #[allow(unsafe_code)]
+    fn clone(&self) -> Self {
+        let data = unsafe {
+            match self.state {
+                State::Inline { .. } => self.data.clone_as_inline(),
+                State::Remote => self.data.clone_as_remote(),
+                State::Subslice { .. } => self.data.clone_as_remote(),
+            }
+        };
+        Self {
+            data,
+            state: self.state.clone(),
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+impl Data {
+    unsafe fn clone_as_inline(&self) -> Self {
+        Self { inline: self.inline }
+    }
+
+    unsafe fn clone_as_remote(&self) -> Self {
+        Self { remote: self.remote.clone() }
+    }
+
+    unsafe fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.remote)
     }
 }
 
 impl FromIterator<u8> for IVec {
     fn from_iter<T>(iter: T) -> Self
-    where
-        T: IntoIterator<Item = u8>,
+        where
+            T: IntoIterator<Item=u8>,
     {
         let bs: Vec<u8> = iter.into_iter().collect();
         bs.into()
@@ -230,11 +280,12 @@ from_array!(
 );
 
 impl Into<Arc<[u8]>> for IVec {
+    #[allow(unsafe_code)]
     fn into(self) -> Arc<[u8]> {
-        match self.0 {
-            IVecInner::Inline(..) => Arc::from(self.as_ref()),
-            IVecInner::Remote(arc) => arc,
-            IVecInner::Subslice { .. } => self.deref().into(),
+        match self.state {
+            State::Inline { .. } => Arc::from(self.as_ref()),
+            State::Remote => unsafe { ManuallyDrop::into_inner(self.data.remote.clone()) },
+            State::Subslice { .. } => self.deref().into(),
         }
     }
 }
@@ -252,13 +303,15 @@ impl AsRef<[u8]> for IVec {
     #[inline]
     #[allow(unsafe_code)]
     fn as_ref(&self) -> &[u8] {
-        match &self.0 {
-            IVecInner::Inline(sz, buf) => unsafe {
-                buf.get_unchecked(..*sz as usize)
-            },
-            IVecInner::Remote(buf) => buf,
-            IVecInner::Subslice { ref base, offset, len } => {
-                &base[*offset..*offset + *len]
+        unsafe {
+            match self.state {
+                State::Inline { len } => {
+                    self.data.inline.get_unchecked(..len as usize)
+                },
+                State::Remote => &self.data.remote,
+                State::Subslice { offset, len } => {
+                    &self.data.remote[offset..offset + len]
+                }
             }
         }
     }
@@ -277,13 +330,15 @@ impl AsMut<[u8]> for IVec {
     fn as_mut(&mut self) -> &mut [u8] {
         self.make_mut();
 
-        match &mut self.0 {
-            IVecInner::Inline(ref sz, ref mut buf) => unsafe {
-                std::slice::from_raw_parts_mut(buf.as_mut_ptr(), *sz as usize)
-            },
-            IVecInner::Remote(ref mut buf) => Arc::get_mut(buf).unwrap(),
-            IVecInner::Subslice { ref mut base, offset, len } => {
-                &mut Arc::get_mut(base).unwrap()[*offset..*offset + *len]
+        unsafe {
+            match self.state {
+                State::Inline { len } => {
+                    std::slice::from_raw_parts_mut(self.data.inline.as_mut_ptr(), len as usize)
+                },
+                State::Remote => Arc::get_mut(&mut self.data.remote).unwrap(),
+                State::Subslice { offset, len } => {
+                    &mut Arc::get_mut(&mut self.data.remote).unwrap()[offset..offset + len]
+                }
             }
         }
     }
@@ -318,6 +373,18 @@ impl Eq for IVec {}
 impl fmt::Debug for IVec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_ref().fmt(f)
+    }
+}
+
+impl Drop for IVec {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        match self.state {
+            State::Remote | State::Subslice { .. } => {
+                unsafe { ManuallyDrop::drop(&mut self.data.remote) };
+            }
+            _ => {}
+        }
     }
 }
 
@@ -360,6 +427,21 @@ fn ivec_as_mut_identity() {
     assert_eq!(&*initial, &*iv);
     assert_eq!(&*initial, &mut *iv);
     assert_eq!(&*initial, iv.as_mut());
+}
+
+#[test]
+fn ivec_alignment() {
+    let iv1 = IVec::from((0..2_u64)
+        .into_iter()
+        .map(u64::to_be_bytes)
+        .flat_map(|b| b.to_vec().into_iter())
+        .collect::<Vec<u8>>());
+    let kind = match iv1.state {
+        State::Inline { .. } => "inline",
+        State::Remote => "remote",
+        State::Subslice { .. } => "subslice",
+    };
+    assert_eq!(iv1.as_ptr() as usize % 8, 0, "{kind}");
 }
 
 #[cfg(test)]
