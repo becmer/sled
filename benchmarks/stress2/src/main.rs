@@ -6,27 +6,77 @@ use std::{
     thread,
 };
 
+#[cfg(feature = "dh")]
+use dhat::{Dhat, DhatAlloc};
+
+use num_format::{Locale, ToFormattedString};
 use rand::{thread_rng, Rng};
 
-#[cfg_attr(
-    // only enable jemalloc on linux and macos by default
-    all(
-        any(target_os = "linux", target_os = "macos"),
-        feature = "jemalloc",
-    ),
-    global_allocator
-)]
-#[cfg(
-    // only enable jemalloc on linux and macos by default
-    all(
-        any(target_os = "linux", target_os = "macos"),
-        feature = "jemalloc",
-    ),
-)]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+#[cfg(feature = "jemalloc")]
+mod alloc {
+    use jemallocator::Jemalloc;
+    use std::alloc::Layout;
+
+    #[global_allocator]
+    static ALLOCATOR: Jemalloc = Jemalloc;
+}
+
+#[cfg(feature = "memshred")]
+mod alloc {
+    use std::alloc::{Layout, System};
+
+    #[global_allocator]
+    static ALLOCATOR: Alloc = Alloc;
+
+    #[derive(Default, Debug, Clone, Copy)]
+    struct Alloc;
+
+    unsafe impl std::alloc::GlobalAlloc for Alloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ret = System.alloc(layout);
+            assert_ne!(ret, std::ptr::null_mut());
+            std::ptr::write_bytes(ret, 0xa1, layout.size());
+            ret
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            std::ptr::write_bytes(ptr, 0xde, layout.size());
+            System.dealloc(ptr, layout)
+        }
+    }
+}
+
+#[cfg(feature = "measure_allocs")]
+mod alloc {
+    use std::alloc::{Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Release};
+
+    pub static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+    pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+    #[global_allocator]
+    static ALLOCATOR: Alloc = Alloc;
+
+    #[derive(Default, Debug, Clone, Copy)]
+    struct Alloc;
+
+    unsafe impl std::alloc::GlobalAlloc for Alloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCATIONS.fetch_add(1, Release);
+            ALLOCATED_BYTES.fetch_add(layout.size(), Release);
+            System.alloc(layout)
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+    }
+}
+
+#[global_allocator]
+#[cfg(feature = "dh")]
+static ALLOCATOR: DhatAlloc = DhatAlloc;
 
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
-static SEQ: AtomicUsize = AtomicUsize::new(0);
 
 const USAGE: &str = "
 Usage: stress [--threads=<#>] [--burn-in] [--duration=<s>] \
@@ -58,9 +108,10 @@ Options:
     --sequential       Run the test in sequential mode instead of random.
     --total-ops=<n>    Stop test after executing a total number of operations.
     --flush-every=<m>  Flush and sync the database every ms [default: 200].
+    --cache-mb=<mb>    Size of the page cache in megabytes [default: 1024].
 ";
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Args {
     threads: usize,
     burn_in: bool,
@@ -77,6 +128,7 @@ struct Args {
     sequential: bool,
     total_ops: Option<usize>,
     flush_every: u64,
+    cache_mb: usize,
 }
 
 impl Default for Args {
@@ -97,6 +149,7 @@ impl Default for Args {
             sequential: false,
             total_ops: None,
             flush_every: 200,
+            cache_mb: 1024,
         }
     }
 }
@@ -131,6 +184,7 @@ impl Args {
                 "sequential" => args.sequential = true,
                 "total-ops" => args.total_ops = Some(parse(&mut splits)),
                 "flush-every" => args.flush_every = parse(&mut splits),
+                "cache-mb" => args.cache_mb = parse(&mut splits),
                 other => panic!("unknown option: {}, {}", other, USAGE),
             }
         }
@@ -144,7 +198,11 @@ fn report(shutdown: Arc<AtomicBool>) {
         thread::sleep(std::time::Duration::from_secs(1));
         let total = TOTAL.load(Ordering::Acquire);
 
-        println!("did {} ops, {}mb RSS", total - last, rss() / (1024 * 1024));
+        println!(
+            "did {} ops, {}mb RSS",
+            (total - last).to_formatted_string(&Locale::en),
+            rss() / (1024 * 1024)
+        );
 
         last = total;
     }
@@ -156,7 +214,7 @@ fn concatenate_merge(
     merged_bytes: &[u8],      // the new bytes being merged in
 ) -> Option<Vec<u8>> {
     // set the new value, return None to delete
-    let mut ret = old_value.map(|ov| ov.to_vec()).unwrap_or_else(|| vec![]);
+    let mut ret = old_value.map(|ov| ov.to_vec()).unwrap_or_else(Vec::new);
 
     ret.extend_from_slice(merged_bytes);
 
@@ -172,21 +230,18 @@ fn run(args: Args, tree: Arc<sled::Db>, shutdown: Arc<AtomicBool>) {
     let scan_max = merge_max + args.scan_prop;
 
     let keygen = |len| -> sled::IVec {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
         let i = if args.sequential {
             SEQ.fetch_add(1, Ordering::Relaxed)
         } else {
             thread_rng().gen::<usize>()
         } % args.entries;
 
-        let i_keygen = i.to_be_bytes();
+        let start = if len < 8 { 8 - len } else { 0 };
 
-        i_keygen
-            .iter()
-            .skip_while(|v| **v == 0)
-            .cycle()
-            .take(len)
-            .copied()
-            .collect()
+        let i_keygen = &i.to_be_bytes()[start..];
+
+        i_keygen.iter().cycle().take(len).copied().collect()
     };
 
     let valgen = |len| -> sled::IVec {
@@ -216,7 +271,7 @@ fn run(args: Args, tree: Arc<sled::Db>, shutdown: Arc<AtomicBool>) {
 
         match choice {
             v if v <= get_max => {
-                tree.get(&key).unwrap();
+                tree.get_zero_copy(&key, |_| {}).unwrap();
             }
             v if v > get_max && v <= set_max => {
                 let value = valgen(args.val_len);
@@ -288,14 +343,22 @@ fn main() {
     #[cfg(feature = "logging")]
     setup_logger();
 
+    #[cfg(feature = "dh")]
+    let _dh = Dhat::start_heap_profiling();
+
     let args = Args::parse();
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    dbg!(args);
+
     let config = sled::Config::new()
-        .cache_capacity(256 * 1024 * 1024)
-        .flush_every_ms(Some(args.flush_every))
-        .print_profile_on_drop(true);
+        .cache_capacity(args.cache_mb * 1024 * 1024)
+        .flush_every_ms(if args.flush_every == 0 {
+            None
+        } else {
+            Some(args.flush_every)
+        });
 
     let tree = Arc::new(config.open().unwrap());
     tree.set_merge_operator(concatenate_merge);
@@ -316,7 +379,6 @@ fn main() {
                 .spawn(move || report(shutdown))
                 .unwrap()
         } else {
-            let args = args.clone();
             thread::spawn(move || run(args, tree, shutdown))
         };
 
@@ -337,16 +399,29 @@ fn main() {
     for t in threads.into_iter() {
         t.join().unwrap();
     }
-
     let ops = TOTAL.load(Ordering::SeqCst);
     let time = now.elapsed().as_secs() as usize;
 
     println!(
         "did {} total ops in {} seconds. {} ops/s",
-        ops,
+        ops.to_formatted_string(&Locale::en),
         time,
-        (ops * 1_000) / (time * 1_000)
+        ((ops * 1_000) / (time * 1_000)).to_formatted_string(&Locale::en)
     );
+
+    #[cfg(feature = "measure_allocs")]
+    println!(
+        "allocated {} bytes in {} allocations",
+        alloc::ALLOCATED_BYTES
+            .load(Ordering::Acquire)
+            .to_formatted_string(&Locale::en),
+        alloc::ALLOCATIONS
+            .load(Ordering::Acquire)
+            .to_formatted_string(&Locale::en),
+    );
+
+    #[cfg(feature = "metrics")]
+    sled::print_profile();
 }
 
 #[cfg(feature = "logging")]
@@ -373,8 +448,8 @@ pub fn setup_logger() {
         })
         .filter(None, log::LevelFilter::Info);
 
-    if let Ok(env_var) = std::env::var("RUST_LOG") {
-        builder.parse(env_var);
+    if let Ok(env) = std::env::var("RUST_LOG") {
+        builder.parse_filters(&env);
     }
 
     let _r = builder.try_init();

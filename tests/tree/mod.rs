@@ -15,7 +15,7 @@ impl fmt::Debug for Key {
             write!(
                 f,
                 "Key(vec![{}; {}])",
-                self.0.get(0).copied().unwrap_or(0),
+                self.0.first().copied().unwrap_or(0),
                 self.0.len()
             )
         } else {
@@ -57,9 +57,9 @@ impl RngCore for SledGen {
 }
 
 pub fn fuzz_then_shrink(buf: &[u8]) {
-    let use_compression = cfg!(feature = "compression")
+    let use_compression = !cfg!(feature = "no_zstd")
         && !cfg!(miri)
-        && buf.get(0).unwrap_or(&0) % 2 == 0;
+        && buf.first().unwrap_or(&0) % 2 == 0;
 
     let ops: Vec<Op> = buf
         .chunks(2)
@@ -197,7 +197,7 @@ fn u16_to_bytes(u: u16) -> Vec<u8> {
 }
 
 // just adds up values as if they were u16's
-fn test_merge_operator(
+fn merge_operator(
     _k: &[u8],
     old: Option<&[u8]>,
     to_merge: &[u8],
@@ -252,7 +252,7 @@ fn prop_tree_matches_btreemap_inner(
         .segment_size(256 * (1 << (segment_size_bits as usize % 16)));
 
     let mut tree = config.open().unwrap();
-    tree.set_merge_operator(test_merge_operator);
+    tree.set_merge_operator(merge_operator);
 
     let mut reference: BTreeMap<Key, u16> = BTreeMap::new();
 
@@ -332,9 +332,9 @@ fn prop_tree_matches_btreemap_inner(
                         .map(Result::unwrap);
                     let ref_iter = reference
                         .iter()
-                        .filter(|&(ref rk, _rv)| **rk >= k)
+                        .filter(|&(rk, _rv)| *rk >= k)
                         .take(len.abs().try_into().unwrap())
-                        .map(|(ref rk, ref rv)| (rk.0.clone(), **rv));
+                        .map(|(rk, rv)| (rk.0.clone(), *rv));
 
                     for r in ref_iter {
                         let tree_next = tree_iter.next().unwrap();
@@ -358,9 +358,9 @@ fn prop_tree_matches_btreemap_inner(
                     let ref_iter = reference
                         .iter()
                         .rev()
-                        .filter(|&(ref rk, _rv)| **rk >= k)
+                        .filter(|&(rk, _rv)| *rk >= k)
                         .take(len.abs().try_into().unwrap())
-                        .map(|(ref rk, ref rv)| (rk.0.clone(), **rv));
+                        .map(|(rk, rv)| (rk.0.clone(), *rv));
 
                     for r in ref_iter {
                         let tree_next = tree_iter.next().unwrap();
@@ -380,7 +380,7 @@ fn prop_tree_matches_btreemap_inner(
             Restart => {
                 drop(tree);
                 tree = config.open().unwrap();
-                tree.set_merge_operator(test_merge_operator);
+                tree.set_merge_operator(merge_operator);
             }
         }
         if let Err(e) = config.global_error() {
@@ -406,7 +406,7 @@ fn prop_tree_matches_btreemap_inner(
 }
 
 #[test]
-fn test_fuzz_test() {
+fn fuzz_test() {
     let seed = [0; 32];
     fuzz_then_shrink(&seed);
     let seed = [0; 31];

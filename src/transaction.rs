@@ -1,4 +1,10 @@
-//! Fully serializable (ACID) multi-`Tree` transactions
+//! Fully serializable (ACID) multi-`Tree` transactions.
+//!
+//! sled transactions are **optimistic** which means that
+//! they may re-run in cases where conflicts are detected.
+//! Do not perform IO or interact with state outside
+//! of the closure unless it is idempotent, because
+//! it may re-run several times.
 //!
 //! # Examples
 //! ```
@@ -75,17 +81,9 @@
 #![allow(clippy::module_name_repetitions)]
 use std::{cell::RefCell, fmt, rc::Rc};
 
-#[cfg(not(feature = "testing"))]
-use std::collections::HashMap as Map;
-
-// we avoid HashMap while testing because
-// it makes tests non-deterministic
-#[cfg(feature = "testing")]
-use std::collections::BTreeMap as Map;
-
 use crate::{
-    concurrency_control, pin, Batch, Error, Guard, IVec, Protector, Result,
-    Tree,
+    concurrency_control, pin, Batch, Error, Event, Guard, IVec, Map, Protector,
+    Result, Tree,
 };
 
 /// A transaction that will
@@ -94,14 +92,14 @@ use crate::{
 #[derive(Clone)]
 pub struct TransactionalTree {
     pub(super) tree: Tree,
-    pub(super) writes: Rc<RefCell<Map<IVec, Option<IVec>>>>,
+    pub(super) writes: Rc<RefCell<Batch>>,
     pub(super) read_cache: Rc<RefCell<Map<IVec, Option<IVec>>>>,
     pub(super) flush_on_commit: Rc<RefCell<bool>>,
 }
 
 /// An error type that is returned from the closure
 /// passed to the `transaction` method.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnabortableTransactionError {
     /// An internal conflict has occurred and the `transaction` method will
     /// retry the passed-in closure until it succeeds. This should never be
@@ -148,8 +146,8 @@ impl<E> From<UnabortableTransactionError> for ConflictableTransactionError<E> {
             UnabortableTransactionError::Conflict => {
                 ConflictableTransactionError::Conflict
             }
-            UnabortableTransactionError::Storage(error) => {
-                ConflictableTransactionError::Storage(error)
+            UnabortableTransactionError::Storage(error2) => {
+                ConflictableTransactionError::Storage(error2)
             }
         }
     }
@@ -157,7 +155,7 @@ impl<E> From<UnabortableTransactionError> for ConflictableTransactionError<E> {
 
 /// An error type that is returned from the closure
 /// passed to the `transaction` method.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictableTransactionError<T = Error> {
     /// A user-provided error type that indicates the transaction should abort.
     /// This is passed into the return value of `transaction` as a direct Err
@@ -200,7 +198,7 @@ impl<E: std::error::Error> std::error::Error
 
 /// An error type that is returned from the closure
 /// passed to the `transaction` method.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionError<T = Error> {
     /// A user-provided error type that indicates the transaction should abort.
     /// This is passed into the return value of `transaction` as a direct Err
@@ -268,8 +266,7 @@ impl TransactionalTree {
     {
         let old = self.get(key.as_ref())?;
         let mut writes = self.writes.borrow_mut();
-        let _last_write =
-            writes.insert(key.into(), Some(value.into()));
+        writes.insert(key, value.into());
         Ok(old)
     }
 
@@ -283,7 +280,7 @@ impl TransactionalTree {
     {
         let old = self.get(key.as_ref());
         let mut writes = self.writes.borrow_mut();
-        let _last_write = writes.insert(key.into(), None);
+        writes.remove(key);
         old
     }
 
@@ -294,7 +291,7 @@ impl TransactionalTree {
     ) -> UnabortableTransactionResult<Option<IVec>> {
         let writes = self.writes.borrow();
         if let Some(first_try) = writes.get(key.as_ref()) {
-            return Ok(first_try.clone());
+            return Ok(first_try.cloned());
         }
         let mut reads = self.read_cache.borrow_mut();
         if let Some(second_try) = reads.get(key.as_ref()) {
@@ -356,16 +353,12 @@ impl TransactionalTree {
         true
     }
 
-    fn commit(&self) -> Result<()> {
-        let writes = self.writes.borrow();
+    fn commit(&self, event: Event) -> Result<()> {
+        let writes = std::mem::take(&mut *self.writes.borrow_mut());
         let mut guard = pin();
-        for (k, v_opt) in &*writes {
-            while self.tree.insert_inner(k, v_opt.clone(), &mut guard)?.is_err()
-            {
-            }
-        }
-        Ok(())
+        self.tree.apply_batch_inner(writes, Some(event), &mut guard)
     }
+
     fn from_tree(tree: &Tree) -> Self {
         Self {
             tree: tree.clone(),
@@ -382,8 +375,8 @@ pub struct TransactionalTrees {
 }
 
 impl TransactionalTrees {
-    fn stage(&self) -> UnabortableTransactionResult<Protector<'_>> {
-        Ok(concurrency_control::write())
+    fn stage(&self) -> Protector<'_> {
+        concurrency_control::write()
     }
 
     fn unstage(&self) {
@@ -403,8 +396,17 @@ impl TransactionalTrees {
 
     fn commit(&self, guard: &Guard) -> Result<()> {
         let peg = self.inner[0].tree.context.pin_log(guard)?;
+
+        let batches = self
+            .inner
+            .iter()
+            .map(|tree| (tree.tree.clone(), tree.writes.borrow().clone()))
+            .collect();
+
+        let event = Event::from_batches(batches);
+
         for tree in &self.inner {
-            tree.commit()?;
+            tree.commit(event.clone())?;
         }
 
         // when the peg drops, it ensures all updates
@@ -431,7 +433,7 @@ impl TransactionalTrees {
 }
 
 /// A simple constructor for `Err(TransactionError::Abort(_))`
-pub fn abort<A, T>(t: T) -> ConflictableTransactionResult<A, T> {
+pub const fn abort<A, T>(t: T) -> ConflictableTransactionResult<A, T> {
     Err(ConflictableTransactionError::Abort(t))
 }
 
@@ -463,12 +465,7 @@ pub trait Transactional<E = ()> {
             let view = Self::view_overlay(&tt);
 
             // NB locks must exist until this function returns.
-            let locks = if let Ok(l) = tt.stage() {
-                l
-            } else {
-                tt.unstage();
-                continue;
-            };
+            let locks = tt.stage();
             let ret = f(&view);
             if !tt.validate() {
                 tt.unstage();
@@ -547,15 +544,13 @@ impl<E> Transactional<E> for [Tree] {
         });
         if !same_db {
             return Err(Error::Unsupported(
-                "cannot use trees from multiple databases in the same transaction".into(),
+                "cannot use trees from multiple \
+                databases in the same transaction",
             ));
         }
 
         Ok(TransactionalTrees {
-            inner: self
-                .iter()
-                .map(|t| TransactionalTree::from_tree(t))
-                .collect(),
+            inner: self.iter().map(TransactionalTree::from_tree).collect(),
         })
     }
 
@@ -575,7 +570,8 @@ impl<E> Transactional<E> for [&Tree] {
         });
         if !same_db {
             return Err(Error::Unsupported(
-                "cannot use trees from multiple databases in the same transaction".into(),
+                "cannot use trees from multiple \
+                databases in the same transaction",
             ));
         }
 
@@ -616,10 +612,11 @@ macro_rules! impl_transactional_tuple_trees {
             type View = repeat_type!(TransactionalTree, ($($indices),+));
 
             fn make_overlay(&self) -> Result<TransactionalTrees> {
-                let mut paths = vec![];
-                $(
-                    paths.push(self.$indices.context.get_path());
-                )+
+                let paths = vec![
+                    $(
+                        self.$indices.context.get_path(),
+                    )+
+                ];
                 if !paths.windows(2).all(|w| {
                     w[0] == w[1]
                 }) {

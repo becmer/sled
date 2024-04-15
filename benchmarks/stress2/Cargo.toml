@@ -10,18 +10,19 @@ panic = 'abort'
 codegen-units = 1
 lto = "fat"
 debug = true
+overflow-checks = true
 
 [features]
 default = []
 lock_free_delays = ["sled/lock_free_delays"]
-io_uring = ["sled/io_uring"]
 event_log = ["sled/event_log"]
-compression = ["sled/compression"]
 no_logs = ["sled/no_logs"]
-no_metrics = ["sled/no_metrics"]
-measure_allocs = ["sled/measure_allocs"]
+metrics = ["sled/metrics"]
 jemalloc = ["jemallocator"]
 logging = ["env_logger", "log", "color-backtrace"]
+dh = ["dhat"]
+memshred = []
+measure_allocs = []
 
 [dependencies]
 rand = "0.7.3"
@@ -29,7 +30,8 @@ env_logger = { version = "0.7.1", optional = true }
 log = { version = "0.4.8", optional = true }
 color-backtrace = { version = "0.3.0", optional = true }
 jemallocator = { version = "0.3.2", optional = true }
+num-format = "0.4.0"
+dhat = { version = "0.2.2", optional = true }
 
 [dependencies.sled]
-default_features = false
 path = "../.."

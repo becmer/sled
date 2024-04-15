@@ -7,11 +7,11 @@ use std::{
 };
 
 use crate::{
-    node::{Index, Leaf},
     pagecache::{
-        BatchManifest, MessageHeader, PageState, SegmentNumber, Snapshot,
+        BatchManifest, HeapId, MessageHeader, PageState, SegmentNumber,
+        Snapshot,
     },
-    Data, DiskPtr, Error, IVec, Link, Meta, Node, Result,
+    varint, DiskPtr, Error, IVec, Link, Meta, Node, Result,
 };
 
 /// Items that may be serialized and deserialized
@@ -92,15 +92,15 @@ impl Serialize for () {
 
 impl Serialize for MessageHeader {
     fn serialized_size(&self) -> u64 {
-        1 + 4
+        4 + 1
+            + self.len.serialized_size()
             + self.segment_number.serialized_size()
             + self.pid.serialized_size()
-            + self.len.serialized_size()
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
         self.crc32.serialize_into(buf);
-        self.kind.into().serialize_into(buf);
+        (self.kind as u8).serialize_into(buf);
         self.len.serialize_into(buf);
         self.segment_number.serialize_into(buf);
         self.pid.serialize_into(buf);
@@ -140,71 +140,11 @@ impl Serialize for IVec {
 
 impl Serialize for u64 {
     fn serialized_size(&self) -> u64 {
-        if *self <= 240 {
-            1
-        } else if *self <= 2287 {
-            2
-        } else if *self <= 67823 {
-            3
-        } else if *self <= 0x00FF_FFFF {
-            4
-        } else if *self <= 0xFFFF_FFFF {
-            5
-        } else if *self <= 0x00FF_FFFF_FFFF {
-            6
-        } else if *self <= 0xFFFF_FFFF_FFFF {
-            7
-        } else if *self <= 0x00FF_FFFF_FFFF_FFFF {
-            8
-        } else {
-            9
-        }
+        varint::size(*self) as u64
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
-        let sz = if *self <= 240 {
-            buf[0] = u8::try_from(*self).unwrap();
-            1
-        } else if *self <= 2287 {
-            buf[0] = u8::try_from((*self - 240) / 256 + 241).unwrap();
-            buf[1] = u8::try_from((*self - 240) % 256).unwrap();
-            2
-        } else if *self <= 67823 {
-            buf[0] = 249;
-            buf[1] = u8::try_from((*self - 2288) / 256).unwrap();
-            buf[2] = u8::try_from((*self - 2288) % 256).unwrap();
-            3
-        } else if *self <= 0x00FF_FFFF {
-            buf[0] = 250;
-            let bytes = self.to_le_bytes();
-            buf[1..4].copy_from_slice(&bytes[..3]);
-            4
-        } else if *self <= 0xFFFF_FFFF {
-            buf[0] = 251;
-            let bytes = self.to_le_bytes();
-            buf[1..5].copy_from_slice(&bytes[..4]);
-            5
-        } else if *self <= 0x00FF_FFFF_FFFF {
-            buf[0] = 252;
-            let bytes = self.to_le_bytes();
-            buf[1..6].copy_from_slice(&bytes[..5]);
-            6
-        } else if *self <= 0xFFFF_FFFF_FFFF {
-            buf[0] = 253;
-            let bytes = self.to_le_bytes();
-            buf[1..7].copy_from_slice(&bytes[..6]);
-            7
-        } else if *self <= 0x00FF_FFFF_FFFF_FFFF {
-            buf[0] = 254;
-            let bytes = self.to_le_bytes();
-            buf[1..8].copy_from_slice(&bytes[..7]);
-            8
-        } else {
-            buf[0] = 255;
-            let bytes = self.to_le_bytes();
-            buf[1..9].copy_from_slice(&bytes[..8]);
-            9
-        };
+        let sz = varint::serialize_into(*self, buf);
 
         scoot(buf, sz);
     }
@@ -213,21 +153,32 @@ impl Serialize for u64 {
         if buf.is_empty() {
             return Err(Error::corruption(None));
         }
-        let (res, scoot) = match buf[0] {
-            0..=240 => (u64::from(buf[0]), 1),
-            241..=248 => {
-                (240 + 256 * (u64::from(buf[0]) - 241) + u64::from(buf[1]), 2)
-            }
-            249 => (2288 + 256 * u64::from(buf[1]) + u64::from(buf[2]), 3),
-            other => {
-                let sz = other as usize - 247;
-                let mut aligned = [0; 8];
-                aligned[..sz].copy_from_slice(&buf[1..=sz]);
-                (u64::from_le_bytes(aligned), sz + 1)
-            }
-        };
+        let (res, scoot) = varint::deserialize(buf)?;
         *buf = &buf[scoot..];
         Ok(res)
+    }
+}
+
+struct NonVarU64(u64);
+
+impl Serialize for NonVarU64 {
+    fn serialized_size(&self) -> u64 {
+        8
+    }
+
+    fn serialize_into(&self, buf: &mut &mut [u8]) {
+        buf[..8].copy_from_slice(&self.0.to_le_bytes());
+        scoot(buf, 8);
+    }
+
+    fn deserialize(buf: &mut &[u8]) -> Result<Self> {
+        if buf.len() < 8 {
+            return Err(Error::corruption(None));
+        }
+
+        let array = buf[..8].try_into().unwrap();
+        *buf = &buf[8..];
+        Ok(NonVarU64(u64::from_le_bytes(array)))
     }
 }
 
@@ -314,24 +265,49 @@ impl Serialize for u8 {
     }
 }
 
-impl Serialize for Meta {
+impl Serialize for HeapId {
     fn serialized_size(&self) -> u64 {
-        self.inner
-            .iter()
-            .map(|(k, v)| {
-                (k.len() as u64).serialized_size()
-                    + u64::try_from(k.len()).unwrap()
-                    + v.serialized_size()
-            })
-            .sum()
+        16
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
+        NonVarU64(self.location).serialize_into(buf);
+        self.original_lsn.serialize_into(buf);
+    }
+
+    fn deserialize(buf: &mut &[u8]) -> Result<HeapId> {
+        Ok(HeapId {
+            location: NonVarU64::deserialize(buf)?.0,
+            original_lsn: i64::deserialize(buf)?,
+        })
+    }
+}
+
+impl Serialize for Meta {
+    fn serialized_size(&self) -> u64 {
+        let len_sz: u64 = (self.inner.len() as u64).serialized_size();
+        let items_sz: u64 = self
+            .inner
+            .iter()
+            .map(|(k, v)| {
+                (k.len() as u64).serialized_size()
+                    + k.len() as u64
+                    + v.serialized_size()
+            })
+            .sum();
+
+        len_sz + items_sz
+    }
+
+    fn serialize_into(&self, buf: &mut &mut [u8]) {
+        (self.inner.len() as u64).serialize_into(buf);
         serialize_2tuple_sequence(self.inner.iter(), buf);
     }
 
     fn deserialize(buf: &mut &[u8]) -> Result<Self> {
-        Ok(Meta { inner: deserialize_sequence(buf)? })
+        let len = u64::deserialize(buf)?;
+        let meta = Meta { inner: deserialize_bounded_sequence(buf, len)? };
+        Ok(meta)
     }
 }
 
@@ -431,38 +407,6 @@ impl Serialize for Option<NonZeroU64> {
     }
 }
 
-impl Serialize for Node {
-    fn serialized_size(&self) -> u64 {
-        2 + self.next.serialized_size()
-            + self.merging_child.serialized_size()
-            + self.lo.serialized_size()
-            + self.hi.serialized_size()
-            + self.data.serialized_size()
-    }
-
-    fn serialize_into(&self, buf: &mut &mut [u8]) {
-        self.next.serialize_into(buf);
-        self.merging_child.serialize_into(buf);
-        self.merging.serialize_into(buf);
-        self.prefix_len.serialize_into(buf);
-        self.lo.serialize_into(buf);
-        self.hi.serialize_into(buf);
-        self.data.serialize_into(buf);
-    }
-
-    fn deserialize(buf: &mut &[u8]) -> Result<Self> {
-        Ok(Node {
-            next: Serialize::deserialize(buf)?,
-            merging_child: Serialize::deserialize(buf)?,
-            merging: bool::deserialize(buf)?,
-            prefix_len: u8::deserialize(buf)?,
-            lo: IVec::deserialize(buf)?,
-            hi: IVec::deserialize(buf)?,
-            data: Data::deserialize(buf)?,
-        })
-    }
-}
-
 impl Serialize for Option<i64> {
     fn serialized_size(&self) -> u64 {
         shift_i64_opt(self).serialized_size()
@@ -477,7 +421,7 @@ impl Serialize for Option<i64> {
 
 fn shift_i64_opt(value_opt: &Option<i64>) -> i64 {
     if let Some(value) = value_opt {
-        if value.signum() == -1 {
+        if *value < 0 {
             *value
         } else {
             value + 1
@@ -487,30 +431,28 @@ fn shift_i64_opt(value_opt: &Option<i64>) -> i64 {
     }
 }
 
-fn unshift_i64_opt(value: i64) -> Option<i64> {
+const fn unshift_i64_opt(value: i64) -> Option<i64> {
     if value == 0 {
-        None
-    } else if value.signum() == -1 {
-        Some(value)
-    } else {
-        Some(value - 1)
+        return None;
     }
+    let subtract = value > 0;
+    Some(value - subtract as i64)
 }
 
 impl Serialize for Snapshot {
     fn serialized_size(&self) -> u64 {
-        self.stable_lsn.serialized_size()
+        self.version.serialized_size()
+            + self.stable_lsn.serialized_size()
             + self.active_segment.serialized_size()
-            + self
-                .pt
-                .iter()
-                .map(|page_state| page_state.serialized_size())
-                .sum::<u64>()
+            + (self.pt.len() as u64).serialized_size()
+            + self.pt.iter().map(Serialize::serialized_size).sum::<u64>()
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
+        self.version.serialize_into(buf);
         self.stable_lsn.serialize_into(buf);
         self.active_segment.serialize_into(buf);
+        (self.pt.len() as u64).serialize_into(buf);
         for page_state in &self.pt {
             page_state.serialize_into(buf);
         }
@@ -518,93 +460,41 @@ impl Serialize for Snapshot {
 
     fn deserialize(buf: &mut &[u8]) -> Result<Self> {
         Ok(Snapshot {
+            version: Serialize::deserialize(buf)?,
             stable_lsn: Serialize::deserialize(buf)?,
             active_segment: Serialize::deserialize(buf)?,
-            pt: deserialize_sequence(buf)?,
+            pt: {
+                let len = u64::deserialize(buf)?;
+                deserialize_bounded_sequence(buf, len)?
+            },
         })
     }
 }
 
-impl Serialize for Data {
+impl Serialize for Node {
     fn serialized_size(&self) -> u64 {
-        match self {
-            Data::Leaf(ref leaf) => {
-                1_u64
-                    + (leaf.keys.len() as u64).serialized_size()
-                    + leaf
-                        .keys
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, k)| {
-                            let v = &leaf.values[idx];
-                            (k.len() as u64).serialized_size()
-                                + (v.len() as u64).serialized_size()
-                                + k.len() as u64
-                                + v.len() as u64
-                        })
-                        .sum::<u64>()
-            }
-            Data::Index(ref index) => {
-                1_u64
-                    + (index.keys.len() as u64).serialized_size()
-                    + index
-                        .keys
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, k)| {
-                            let v = index.pointers[idx];
-                            (k.len() as u64).serialized_size()
-                                + v.serialized_size()
-                                + k.len() as u64
-                        })
-                        .sum::<u64>()
-            }
-        }
+        let size = self.rss();
+        size.serialized_size() + size
     }
 
     fn serialize_into(&self, buf: &mut &mut [u8]) {
-        match self {
-            Data::Leaf(leaf) => {
-                0_u8.serialize_into(buf);
-                (leaf.keys.len() as u64).serialize_into(buf);
-                for key in &leaf.keys {
-                    key.serialize_into(buf);
-                }
-                for value in &leaf.values {
-                    value.serialize_into(buf);
-                }
-            }
-            Data::Index(index) => {
-                1_u8.serialize_into(buf);
-                (index.keys.len() as u64).serialize_into(buf);
-                for key in &index.keys {
-                    key.serialize_into(buf);
-                }
-                for value in &index.pointers {
-                    value.serialize_into(buf);
-                }
-            }
-        }
+        assert!(self.overlay.is_empty());
+        self.rss().serialize_into(buf);
+        buf[..self.len()].copy_from_slice(self.as_ref());
+        scoot(buf, self.len());
     }
 
-    fn deserialize(buf: &mut &[u8]) -> Result<Data> {
+    fn deserialize(buf: &mut &[u8]) -> Result<Node> {
         if buf.is_empty() {
             return Err(Error::corruption(None));
         }
-        let discriminant = buf[0];
-        *buf = &buf[1..];
         let len = usize::try_from(u64::deserialize(buf)?).unwrap();
-        Ok(match discriminant {
-            0 => Data::Leaf(Leaf {
-                keys: deserialize_bounded_sequence(buf, len)?,
-                values: deserialize_bounded_sequence(buf, len)?,
-            }),
-            1 => Data::Index(Index {
-                keys: deserialize_bounded_sequence(buf, len)?,
-                pointers: deserialize_bounded_sequence(buf, len)?,
-            }),
-            _ => return Err(Error::corruption(None)),
-        })
+
+        #[allow(unsafe_code)]
+        let sst = unsafe { Node::from_raw(&buf[..len]) };
+
+        *buf = &buf[len..];
+        Ok(sst)
     }
 }
 
@@ -612,7 +502,7 @@ impl Serialize for DiskPtr {
     fn serialized_size(&self) -> u64 {
         match self {
             DiskPtr::Inline(a) => 1 + a.serialized_size(),
-            DiskPtr::Blob(a, b) => {
+            DiskPtr::Heap(a, b) => {
                 1 + a.serialized_size() + b.serialized_size()
             }
         }
@@ -624,10 +514,10 @@ impl Serialize for DiskPtr {
                 0_u8.serialize_into(buf);
                 log_offset.serialize_into(buf);
             }
-            DiskPtr::Blob(log_offset, blob_lsn) => {
+            DiskPtr::Heap(log_offset, heap_id) => {
                 1_u8.serialize_into(buf);
                 log_offset.serialize_into(buf);
-                blob_lsn.serialize_into(buf);
+                heap_id.serialize_into(buf);
             }
         }
     }
@@ -640,7 +530,10 @@ impl Serialize for DiskPtr {
         *buf = &buf[1..];
         Ok(match discriminant {
             0 => DiskPtr::Inline(u64::deserialize(buf)?),
-            1 => DiskPtr::Blob(u64::deserialize(buf)?, i64::deserialize(buf)?),
+            1 => DiskPtr::Heap(
+                Serialize::deserialize(buf)?,
+                HeapId::deserialize(buf)?,
+            ),
             _ => return Err(Error::corruption(None)),
         })
     }
@@ -650,14 +543,14 @@ impl Serialize for PageState {
     fn serialized_size(&self) -> u64 {
         match self {
             PageState::Free(a, disk_ptr) => {
-                1 + a.serialized_size() + disk_ptr.serialized_size()
+                0_u64.serialized_size()
+                    + a.serialized_size()
+                    + disk_ptr.serialized_size()
             }
             PageState::Present { base, frags } => {
-                1 + base.serialized_size()
-                    + frags
-                        .iter()
-                        .map(|tuple| tuple.serialized_size())
-                        .sum::<u64>()
+                (1 + frags.len() as u64).serialized_size()
+                    + base.serialized_size()
+                    + frags.iter().map(Serialize::serialized_size).sum::<u64>()
             }
             _ => panic!("tried to serialize {:?}", self),
         }
@@ -666,16 +559,14 @@ impl Serialize for PageState {
     fn serialize_into(&self, buf: &mut &mut [u8]) {
         match self {
             PageState::Free(lsn, disk_ptr) => {
-                0_u8.serialize_into(buf);
+                0_u64.serialize_into(buf);
                 lsn.serialize_into(buf);
                 disk_ptr.serialize_into(buf);
             }
             PageState::Present { base, frags } => {
-                let frags_len: u8 = 1 + u8::try_from(frags.len())
-                    .expect("should never have more than 255 frags");
-                frags_len.serialize_into(buf);
+                (1 + frags.len() as u64).serialize_into(buf);
                 base.serialize_into(buf);
-                serialize_3tuple_ref_sequence(frags.iter(), buf);
+                serialize_2tuple_ref_sequence(frags.iter(), buf);
             }
             _ => panic!("tried to serialize {:?}", self),
         }
@@ -685,16 +576,15 @@ impl Serialize for PageState {
         if buf.is_empty() {
             return Err(Error::corruption(None));
         }
-        let discriminant = buf[0];
-        *buf = &buf[1..];
-        Ok(match discriminant {
+        let len = u64::deserialize(buf)?;
+        Ok(match len {
             0 => PageState::Free(
                 i64::deserialize(buf)?,
                 DiskPtr::deserialize(buf)?,
             ),
-            len => PageState::Present {
+            _ => PageState::Present {
                 base: Serialize::deserialize(buf)?,
-                frags: deserialize_bounded_sequence(buf, usize::from(len - 1))?,
+                frags: deserialize_bounded_sequence(buf, len - 1)?,
             },
         })
     }
@@ -750,43 +640,33 @@ where
     }
 }
 
-fn serialize_3tuple_ref_sequence<'a, XS, A, B, C>(xs: XS, buf: &mut &mut [u8])
+fn serialize_2tuple_ref_sequence<'a, XS, A, B>(xs: XS, buf: &mut &mut [u8])
 where
-    XS: Iterator<Item = &'a (A, B, C)>,
+    XS: Iterator<Item = &'a (A, B)>,
     A: Serialize + 'a,
     B: Serialize + 'a,
-    C: Serialize + 'a,
 {
     for item in xs {
         item.0.serialize_into(buf);
         item.1.serialize_into(buf);
-        item.2.serialize_into(buf);
     }
 }
 
 struct ConsumeSequence<'a, 'b, T> {
     buf: &'a mut &'b [u8],
     _t: PhantomData<T>,
-    done: bool,
-}
-
-fn deserialize_sequence<T: Serialize, R>(buf: &mut &[u8]) -> Result<R>
-where
-    R: FromIterator<T>,
-{
-    let iter = ConsumeSequence { buf, _t: PhantomData, done: false };
-    iter.collect()
+    bound: u64,
 }
 
 fn deserialize_bounded_sequence<T: Serialize, R>(
     buf: &mut &[u8],
-    bound: usize,
+    bound: u64,
 ) -> Result<R>
 where
     R: FromIterator<T>,
 {
-    let iter = ConsumeSequence { buf, _t: PhantomData, done: false };
-    iter.take(bound).collect()
+    let iter = ConsumeSequence { buf, _t: PhantomData, bound };
+    iter.collect()
 }
 
 impl<'a, 'b, T> Iterator for ConsumeSequence<'a, 'b, T>
@@ -796,12 +676,13 @@ where
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Result<T>> {
-        if self.done || self.buf.is_empty() {
+        if self.bound == 0 || self.buf.is_empty() {
             return None;
         }
-        let item_res = T::deserialize(&mut self.buf);
+        let item_res = T::deserialize(self.buf);
+        self.bound -= 1;
         if item_res.is_err() {
-            self.done = true;
+            self.bound = 0;
         }
         Some(item_res)
     }
@@ -827,99 +708,18 @@ mod qc {
         }
     }
 
+    impl Arbitrary for HeapId {
+        fn arbitrary<G: Gen>(g: &mut G) -> HeapId {
+            HeapId {
+                location: SpreadU64::arbitrary(g).0,
+                original_lsn: SpreadI64::arbitrary(g).0,
+            }
+        }
+    }
+
     impl Arbitrary for MessageKind {
         fn arbitrary<G: Gen>(g: &mut G) -> MessageKind {
             g.gen_range(0, 12).into()
-        }
-    }
-
-    impl Arbitrary for Data {
-        fn arbitrary<G: Gen>(g: &mut G) -> Data {
-            if g.gen() {
-                let keys = Arbitrary::arbitrary(g);
-                let mut values = vec![];
-                for _ in &keys {
-                    values.push(Arbitrary::arbitrary(g))
-                }
-                Data::Index(Index { keys, pointers: values })
-            } else {
-                let keys = Arbitrary::arbitrary(g);
-                let mut values = vec![];
-                for _ in &keys {
-                    values.push(Arbitrary::arbitrary(g))
-                }
-                Data::Leaf(Leaf { keys, values })
-            }
-        }
-
-        fn shrink(&self) -> Box<dyn Iterator<Item = Data>> {
-            match self {
-                Data::Index(ref index) => {
-                    let index = index.clone();
-                    Box::new(index.keys.shrink().map(move |keys| {
-                        Data::Index(Index {
-                            pointers: index
-                                .pointers
-                                .iter()
-                                .take(keys.len())
-                                .copied()
-                                .collect(),
-                            keys,
-                        })
-                    }))
-                }
-                Data::Leaf(ref leaf) => {
-                    let leaf = leaf.clone();
-                    Box::new(leaf.keys.shrink().map(move |keys| {
-                        Data::Leaf(Leaf {
-                            values: leaf
-                                .values
-                                .iter()
-                                .take(keys.len())
-                                .cloned()
-                                .collect(),
-                            keys,
-                        })
-                    }))
-                }
-            }
-        }
-    }
-
-    impl Arbitrary for Node {
-        fn arbitrary<G: Gen>(g: &mut G) -> Node {
-            let next: Option<NonZeroU64> = Arbitrary::arbitrary(g);
-
-            let merging_child: Option<NonZeroU64> = Arbitrary::arbitrary(g);
-
-            Node {
-                next,
-                merging_child,
-                merging: bool::arbitrary(g),
-                prefix_len: u8::arbitrary(g),
-                lo: IVec::arbitrary(g),
-                hi: IVec::arbitrary(g),
-                data: Data::arbitrary(g),
-            }
-        }
-
-        fn shrink(&self) -> Box<dyn Iterator<Item = Node>> {
-            let data_shrinker = self.data.shrink().map({
-                let node = self.clone();
-                move |data| Node { data, ..node.clone() }
-            });
-
-            let hi_shrinker = self.hi.shrink().map({
-                let node = self.clone();
-                move |hi| Node { hi, ..node.clone() }
-            });
-
-            let lo_shrinker = self.lo.shrink().map({
-                let node = self.clone();
-                move |lo| Node { lo, ..node.clone() }
-            });
-
-            Box::new(data_shrinker.chain(hi_shrinker).chain(lo_shrinker))
         }
     }
 
@@ -964,7 +764,7 @@ mod qc {
             if g.gen() {
                 DiskPtr::Inline(g.gen())
             } else {
-                DiskPtr::Blob(g.gen(), g.gen())
+                DiskPtr::Heap(g.gen(), HeapId::arbitrary(g))
             }
         }
     }
@@ -977,10 +777,9 @@ mod qc {
                 // for the base fragment
                 let n = g.gen_range(0, 255);
 
-                let base = (g.gen(), DiskPtr::arbitrary(g), g.gen());
-                let frags = (0..n)
-                    .map(|_| (g.gen(), DiskPtr::arbitrary(g), g.gen()))
-                    .collect();
+                let base = (g.gen(), DiskPtr::arbitrary(g));
+                let frags =
+                    (0..n).map(|_| (g.gen(), DiskPtr::arbitrary(g))).collect();
                 PageState::Present { base, frags }
             } else {
                 PageState::Free(g.gen(), DiskPtr::arbitrary(g))
@@ -991,6 +790,7 @@ mod qc {
     impl Arbitrary for Snapshot {
         fn arbitrary<G: Gen>(g: &mut G) -> Snapshot {
             Snapshot {
+                version: g.gen(),
                 stable_lsn: g.gen(),
                 active_segment: g.gen(),
                 pt: Arbitrary::arbitrary(g),
@@ -1038,8 +838,8 @@ mod qc {
             true
         } else {
             eprintln!(
-                "round-trip serialization failed. original:\n\n{:?}\n\n \
-                 deserialized(serialized(original)):\n\n{:?}",
+                "\nround-trip serialization failed. original:\n\n{:?}\n\n \
+                 deserialized(serialized(original)):\n\n{:?}\n",
                 item, deserialized
             );
             false
@@ -1093,11 +893,6 @@ mod qc {
         }
 
         #[cfg_attr(miri, ignore)]
-        fn data(item: Data) -> bool {
-            prop_serialize(&item)
-        }
-
-        #[cfg_attr(miri, ignore)]
         fn link(item: Link) -> bool {
             prop_serialize(&item)
         }
@@ -1106,22 +901,5 @@ mod qc {
         fn msg_header(item: MessageHeader) -> bool {
             prop_serialize(&item)
         }
-    }
-
-    #[test]
-    fn debug_node() {
-        // color_backtrace::install();
-
-        let node = Node {
-            next: None,
-            lo: vec![].into(),
-            hi: vec![].into(),
-            merging_child: None,
-            merging: true,
-            prefix_len: 0,
-            data: Data::Index(Index::default()),
-        };
-
-        prop_serialize(&node);
     }
 }

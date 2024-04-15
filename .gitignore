@@ -1,3 +1,5 @@
+default.sled
+crash_*
 *db
 *conf
 *snap.*

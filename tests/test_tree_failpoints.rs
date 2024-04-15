@@ -52,6 +52,9 @@ impl Arbitrary for Op {
             "buffer write post",
             "write_config bytes",
             "write_config crc",
+            "write_config fsync",
+            "write_config rename",
+            "write_config dir fsync",
             "write_config post",
             "segment initial free zero",
             "snap write",
@@ -59,6 +62,7 @@ impl Arbitrary for Op {
             "snap write crc",
             "snap write post",
             "snap write mv",
+            "snap write dir fsync",
             "snap write mv post",
             "snap write rm old",
             "blob blob write",
@@ -66,6 +70,8 @@ impl Arbitrary for Op {
             "write_blob write kind_byte",
             "write_blob write buf",
             "file truncation",
+            "pwrite",
+            "pwrite partial",
         ];
 
         if g.gen_bool(1. / 30.) {
@@ -243,7 +249,7 @@ fn run_tree_crashes_nicely(ops: Vec<Op>, flusher: bool) -> bool {
                     continue;
                 }
                 // find the last version from a stable batch, if there is one,
-                // throw away all preceeding versions
+                // throw away all preceding versions
                 let committed_find_result = ref_entry.versions.iter().enumerate().rev().find(|(_, ReferenceVersion{ batch, value: _ })| match batch {
                     Some(batch) => *batch <= stable_batch,
                     None => false,
@@ -479,10 +485,7 @@ fn run_tree_crashes_nicely(ops: Vec<Op>, flusher: bool) -> bool {
                     if reference_entry.versions.len() > 1
                         && reference_entry.crash_epoch == crash_counter
                     {
-                        let last = std::mem::replace(
-                            &mut reference_entry.versions,
-                            Vec::new(),
-                        )
+                        let last = std::mem::take(&mut reference_entry.versions)
                         .pop()
                         .unwrap();
                         reference_entry.versions.push(last);
@@ -493,7 +496,7 @@ fn run_tree_crashes_nicely(ops: Vec<Op>, flusher: bool) -> bool {
                 restart!();
             }
             FailPoint(fp, bitset) => {
-                sled::fail::set(&*fp, bitset);
+                sled::fail::set(fp, bitset);
             }
         }
     }
@@ -1755,5 +1758,90 @@ fn failpoints_bug_35() {
             ],
             true
         ));
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn failpoints_bug_36() {
+    // postmortem 1: in `Tree::attempt_fmt` a result from the pagecache
+    // was asserted on rather than propagated, which caused failpoints
+    // to turn into panics.
+    use BatchOp::*;
+    for _ in 0..50 {
+        assert!(prop_tree_crashes_nicely(
+            vec![
+                Op::Batched(vec![
+                    Set,
+                    Set,
+                    Del(203),
+                    Set,
+                    Del(14),
+                    Set,
+                    Set,
+                    Set,
+                    Del(209),
+                    Set,
+                    Set,
+                    Set,
+                    Set,
+                    Set
+                ]),
+                Op::Set,
+                Op::Restart,
+                Op::FailPoint("buffer write post", 17420268517488604084),
+                Op::Restart
+            ],
+            true
+        ))
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn failpoints_bug_37() {
+    // postmortem 1: global errors were not being properly set
+    use BatchOp::*;
+    for _ in 0..100 {
+        assert!(prop_tree_crashes_nicely(
+            vec![
+                Op::Batched(vec![Set, Set, Set, Set, Set, Set, Set]),
+                Op::FailPoint("pwrite", 13605093379298630254),
+                Op::Restart,
+            ],
+            false
+        ))
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn failpoints_bug_38() {
+    // postmortem 1: global errors were not being properly set
+    use BatchOp::*;
+    for _ in 0..100 {
+        assert!(prop_tree_crashes_nicely(
+            vec![
+                Op::Batched(vec![
+                    Set, Set, Set, Set, Set, Set, Set, Set, Set, Set, Set, Set,
+                ]),
+                Op::FailPoint("pwrite partial", 18422008228777642734),
+                Op::Set,
+            ],
+            false
+        ))
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn failpoints_bug_39() {
+    // postmortem 1:
+    use BatchOp::*;
+    for i in 0..100 {
+        assert!(prop_tree_crashes_nicely(
+            vec![Op::Batched(vec![Set; i % 50]), Op::Restart],
+            true
+        ))
     }
 }

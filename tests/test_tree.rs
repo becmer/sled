@@ -1,7 +1,13 @@
 mod common;
 mod tree;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc, Barrier,
+    },
+    time::Duration,
+};
 
 #[allow(unused_imports)]
 use log::{debug, warn};
@@ -21,12 +27,147 @@ const N: usize = N_THREADS * N_PER_THREAD; // NB N should be multiple of N_THREA
 const SPACE: usize = N;
 
 #[allow(dead_code)]
-const INTENSITY: usize = 5;
+const INTENSITY: usize = 10;
 
 fn kv(i: usize) -> Vec<u8> {
     let i = i % SPACE;
     let k = [(i >> 16) as u8, (i >> 8) as u8, i as u8];
     k.to_vec()
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn monotonic_inserts() {
+    common::setup_logger();
+
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+
+    for len in [1_usize, 16, 32, 1024].iter() {
+        for i in 0_usize..*len {
+            let mut k = vec![];
+            for c in 0_usize..i {
+                k.push((c % 256) as u8);
+            }
+            db.insert(&k, &[]).unwrap();
+        }
+
+        let count = db.iter().count();
+        assert_eq!(count, *len as usize);
+
+        let count2 = db.iter().rev().count();
+        assert_eq!(count2, *len as usize);
+
+        db.clear().unwrap();
+    }
+
+    for len in [1_usize, 16, 32, 1024].iter() {
+        for i in (0_usize..*len).rev() {
+            let mut k = vec![];
+            for c in (0_usize..i).rev() {
+                k.push((c % 256) as u8);
+            }
+            db.insert(&k, &[]).unwrap();
+        }
+
+        let count3 = db.iter().count();
+        assert_eq!(count3, *len as usize);
+
+        let count4 = db.iter().rev().count();
+        assert_eq!(count4, *len as usize);
+
+        db.clear().unwrap();
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn fixed_stride_inserts() {
+    // this is intended to test the fixed stride key omission optimization
+    common::setup_logger();
+
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+
+    let mut expected = std::collections::HashSet::new();
+    for k in 0..4096_u16 {
+        db.insert(&k.to_be_bytes(), &[]).unwrap();
+        expected.insert(k.to_be_bytes().to_vec());
+    }
+
+    let mut count = 0_u16;
+    for kvr in db.iter() {
+        let (k, _) = kvr.unwrap();
+        assert_eq!(&k, &count.to_be_bytes());
+        count += 1;
+    }
+    assert_eq!(count, 4096, "tree: {:?}", db);
+    assert_eq!(db.len(), 4096);
+
+    let count = db.iter().rev().count();
+    assert_eq!(count, 4096);
+
+    for k in 0..4096_u16 {
+        db.insert(&k.to_be_bytes(), &[1]).unwrap();
+    }
+
+    let count = db.iter().count();
+    assert_eq!(count, 4096);
+
+    let count = db.iter().rev().count();
+    assert_eq!(count, 4096);
+    assert_eq!(db.len(), 4096);
+
+    for k in 0..4096_u16 {
+        db.remove(&k.to_be_bytes()).unwrap();
+    }
+
+    let count = db.iter().count();
+    assert_eq!(count, 0);
+
+    let count = db.iter().rev().count();
+    assert_eq!(count, 0);
+    assert_eq!(db.len(), 0);
+    assert!(db.is_empty());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn sequential_inserts() {
+    common::setup_logger();
+
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+
+    for len in [1, 16, 32, u16::MAX].iter() {
+        for i in 0..*len {
+            db.insert(&i.to_le_bytes(), &[]).unwrap();
+        }
+
+        let count = db.iter().count();
+        assert_eq!(count, *len as usize);
+
+        let count2 = db.iter().rev().count();
+        assert_eq!(count2, *len as usize);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn reverse_inserts() {
+    common::setup_logger();
+
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+
+    for len in [1, 16, 32, u16::MAX].iter() {
+        for i in 0..*len {
+            let i2 = u16::MAX - i;
+            db.insert(&i2.to_le_bytes(), &[]).unwrap();
+        }
+
+        let count = db.iter().count();
+        assert_eq!(count, *len as usize);
+
+        let count2 = db.iter().rev().count();
+        assert_eq!(count2, *len as usize);
+    }
 }
 
 #[test]
@@ -52,7 +193,7 @@ fn very_large_reverse_tree_iterator() {
 
 #[test]
 #[cfg(all(target_os = "linux", not(miri)))]
-fn test_varied_compression_ratios() {
+fn varied_compression_ratios() {
     // tests for the compression issue reported in #938 by @Mrmaxmeier.
 
     let low_entropy = vec![0u8; 64 << 10]; // 64k zeroes
@@ -101,9 +242,12 @@ fn concurrent_tree_pops() -> sled::Result<()> {
     let mut threads = vec![];
 
     // Pop 5 values using multiple threads
+    let barrier = Arc::new(Barrier::new(5));
     for _ in 0..5 {
+        let barrier = barrier.clone();
         let db = db.clone();
         threads.push(thread::spawn(move || {
+            barrier.wait();
             db.pop_min().unwrap().unwrap();
         }));
     }
@@ -283,12 +427,13 @@ fn concurrent_tree_iter() -> Result<()> {
     ];
 
     for item in &INDELIBLE {
-        t.insert(item.to_vec(), item.to_vec())?;
+        t.insert(item, item.to_vec())?;
     }
 
     let barrier = Arc::new(Barrier::new(N_FORWARD + N_REVERSE + 2));
 
     let mut threads: Vec<thread::JoinHandle<Result<()>>> = vec![];
+    static I: AtomicUsize = AtomicUsize::new(0);
 
     for i in 0..N_FORWARD {
         let t = thread::Builder::new()
@@ -297,6 +442,7 @@ fn concurrent_tree_iter() -> Result<()> {
                 let t = t.clone();
                 let barrier = barrier.clone();
                 move || {
+                    I.fetch_add(1, SeqCst);
                     barrier.wait();
                     for _ in 0..100 {
                         let expected = INDELIBLE.iter();
@@ -319,6 +465,7 @@ fn concurrent_tree_iter() -> Result<()> {
                             }
                         }
                     }
+                    I.fetch_sub(1, SeqCst);
 
                     Ok(())
                 }
@@ -334,6 +481,7 @@ fn concurrent_tree_iter() -> Result<()> {
                 let t = t.clone();
                 let barrier = barrier.clone();
                 move || {
+                    I.fetch_add(1, SeqCst);
                     barrier.wait();
                     for _ in 0..100 {
                         let expected = INDELIBLE.iter().rev();
@@ -360,6 +508,7 @@ fn concurrent_tree_iter() -> Result<()> {
                             }
                         }
                     }
+                    I.fetch_sub(1, SeqCst);
 
                     Ok(())
                 }
@@ -377,13 +526,15 @@ fn concurrent_tree_iter() -> Result<()> {
             move || {
                 barrier.wait();
 
-                for i in 0..(16 * 16 * 8) {
-                    let major = i / (16 * 8);
-                    let minor = i % 16;
+                while I.load(SeqCst) != 0 {
+                    for i in 0..(16 * 16 * 8) {
+                        let major = i / (16 * 8);
+                        let minor = i % 16;
 
-                    let mut base = INDELIBLE[major].to_vec();
-                    base.push(minor as u8);
-                    t.insert(base.clone(), base.clone())?;
+                        let mut base = INDELIBLE[major].to_vec();
+                        base.push(minor as u8);
+                        t.insert(base.clone(), base.clone())?;
+                    }
                 }
 
                 Ok(())
@@ -399,13 +550,15 @@ fn concurrent_tree_iter() -> Result<()> {
             move || {
                 barrier.wait();
 
-                for i in 0..(16 * 16 * 8) {
-                    let major = i / (16 * 8);
-                    let minor = i % 16;
+                while I.load(SeqCst) != 0 {
+                    for i in 0..(16 * 16 * 8) {
+                        let major = i / (16 * 8);
+                        let minor = i % 16;
 
-                    let mut base = INDELIBLE[major].to_vec();
-                    base.push(minor as u8);
-                    t.remove(&base)?;
+                        let mut base = INDELIBLE[major].to_vec();
+                        base.push(minor as u8);
+                        t.remove(&base)?;
+                    }
                 }
 
                 Ok(())
@@ -722,17 +875,17 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
 
     let db = config.open().unwrap();
 
-    let t1 = db.open_tree(b"1".to_vec())?;
-    let mut s1 = t1.watch_prefix(b"".to_vec());
+    let t1 = db.open_tree(b"1")?;
+    let mut s1 = t1.watch_prefix(b"");
 
-    let t2 = db.open_tree(b"2".to_vec())?;
-    let mut s2 = t2.watch_prefix(b"".to_vec());
+    let t2 = db.open_tree(b"2")?;
+    let mut s2 = t2.watch_prefix(b"");
 
     t1.insert(b"t1_a", b"t1_a".to_vec())?;
     t2.insert(b"t2_a", b"t2_a".to_vec())?;
 
-    assert_eq!(s1.next().unwrap().key(), b"t1_a");
-    assert_eq!(s2.next().unwrap().key(), b"t2_a");
+    assert_eq!(s1.next().unwrap().iter().next().unwrap().1, b"t1_a");
+    assert_eq!(s2.next().unwrap().iter().next().unwrap().1, b"t2_a");
 
     let guard = pin();
     guard.flush();
@@ -744,11 +897,11 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
 
     let db = config.open().unwrap();
 
-    let t1 = db.open_tree(b"1".to_vec())?;
-    let mut s1 = t1.watch_prefix(b"".to_vec());
+    let t1 = db.open_tree(b"1")?;
+    let mut s1 = t1.watch_prefix(b"");
 
-    let t2 = db.open_tree(b"2".to_vec())?;
-    let mut s2 = t2.watch_prefix(b"".to_vec());
+    let t2 = db.open_tree(b"2")?;
+    let mut s2 = t2.watch_prefix(b"");
 
     assert!(db.is_empty());
     assert_eq!(t1.len(), 1);
@@ -757,8 +910,8 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
     t1.insert(b"t1_b", b"t1_b".to_vec())?;
     t2.insert(b"t2_b", b"t2_b".to_vec())?;
 
-    assert_eq!(s1.next().unwrap().key(), b"t1_b");
-    assert_eq!(s2.next().unwrap().key(), b"t2_b");
+    assert_eq!(s1.next().unwrap().iter().next().unwrap().1, b"t1_b");
+    assert_eq!(s2.next().unwrap().iter().next().unwrap().1, b"t2_b");
 
     let guard = pin();
     guard.flush();
@@ -770,8 +923,8 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
 
     let db = config.open().unwrap();
 
-    let t1 = db.open_tree(b"1".to_vec())?;
-    let t2 = db.open_tree(b"2".to_vec())?;
+    let t1 = db.open_tree(b"1")?;
+    let t2 = db.open_tree(b"2")?;
 
     assert!(db.is_empty());
     assert_eq!(t1.len(), 2);
@@ -780,9 +933,9 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
     db.drop_tree(b"1")?;
     db.drop_tree(b"2")?;
 
-    assert_eq!(t1.get(b""), Err(Error::CollectionNotFound(b"1".into())));
+    assert_eq!(t1.get(b""), Err(Error::CollectionNotFound));
 
-    assert_eq!(t2.get(b""), Err(Error::CollectionNotFound(b"2".into())));
+    assert_eq!(t2.get(b""), Err(Error::CollectionNotFound));
 
     let guard = pin();
     guard.flush();
@@ -794,8 +947,8 @@ fn tree_subscribers_and_keyspaces() -> Result<()> {
 
     let db = config.open().unwrap();
 
-    let t1 = db.open_tree(b"1".to_vec())?;
-    let t2 = db.open_tree(b"2".to_vec())?;
+    let t1 = db.open_tree(b"1")?;
+    let t2 = db.open_tree(b"2")?;
 
     assert!(db.is_empty());
     assert_eq!(t1.len(), 0);
@@ -900,6 +1053,23 @@ fn create_tree() {
     let config = Config::new().create_new(true).path(path);
     config.open().unwrap_err();
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn contains_tree() {
+    let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
+    let tree_one = db.open_tree("tree 1").unwrap();
+    let tree_two = db.open_tree("tree 2").unwrap();
+
+    drop(tree_one);
+    drop(tree_two);
+
+    assert_eq!(false, db.contains_tree("tree 3"));
+    assert_eq!(true, db.contains_tree("tree 1"));
+    assert_eq!(true, db.contains_tree("tree 2"));
+
+    assert!(db.drop_tree("tree 1").unwrap());
+    assert_eq!(false, db.contains_tree("tree 1"));
 }
 
 #[test]
@@ -1200,10 +1370,14 @@ fn tree_bug_08() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn tree_bug_09() {
-    // postmortem: was failing to load existing snapshots on initialization.
+    // postmortem 1: was failing to load existing snapshots on initialization.
     // would encounter uninitialized segments at the log tip and overwrite
     // the first segment (indexed by LSN of 0) in the segment accountant
     // ordering, skipping over important updates.
+    //
+    // postmortem 2: page size tracking was inconsistent in SA. completely
+    // removed exact size tracking, and went back to simpler pure-page
+    // tenancy model.
     prop_tree_matches_btreemap(
         vec![
             Set(Key(vec![189]), 36),
@@ -1557,7 +1731,7 @@ fn tree_bug_22() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn tree_bug_23() {
-    // postmortem: when rewriting CRC handling code, mis-sized the blob crc
+    // postmortem: when rewriting CRC handling code, miss-sized the blob crc
     prop_tree_matches_btreemap(
         vec![Set(Key(vec![6; 5120]), 92), Restart, Scan(Key(vec![]), 35)],
         false,
@@ -2368,8 +2542,8 @@ fn tree_bug_39() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn tree_bug_40() {
-    // postmortem: deletions of non-existant keys were
-    // being persisted despite being unneccessary.
+    // postmortem: deletions of non-existent keys were
+    // being persisted despite being unnecessary.
     prop_tree_matches_btreemap(
         vec![Del(Key(vec![99; 111222333]))],
         false,
@@ -2498,4 +2672,87 @@ fn tree_bug_45() {
             210
         ))
     }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn tree_bug_46() {
+    // postmortem: while implementing the heap slab, decompression
+    // was failing to account for the fact that the slab allocator
+    // will always write to the end of the slab to be compatible
+    // with O_DIRECT.
+    for _ in 0..1 {
+        assert!(prop_tree_matches_btreemap(vec![Restart], false, true, 0, 0))
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn tree_bug_47() {
+    // postmortem:
+    assert!(prop_tree_matches_btreemap(
+        vec![Set(Key(vec![88; 1]), 40), Restart, Get(Key(vec![88; 1]))],
+        false,
+        false,
+        0,
+        0
+    ))
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn tree_bug_48() {
+    // postmortem: node value buffer calculations were failing to
+    // account for potential padding added to avoid buffer overreads
+    // while looking up offsets.
+    assert!(prop_tree_matches_btreemap(
+        vec![
+            Set(Key(vec![23; 1]), 78),
+            Set(Key(vec![120; 1]), 223),
+            Set(Key(vec![123; 1]), 235),
+            Set(Key(vec![60; 1]), 234),
+            Set(Key(vec![]), 71),
+            Del(Key(vec![120; 1])),
+            Scan(Key(vec![]), -9)
+        ],
+        false,
+        false,
+        0,
+        0
+    ))
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn tree_bug_49() {
+    // postmortem: was incorrectly calculating the child offset while searching
+    // for a node with omitted keys, where the distance == the stride, and
+    // as a result we went into an infinite loop trying to apply a parent
+    // split that was already present
+    assert!(prop_tree_matches_btreemap(
+        vec![
+            Set(Key(vec![39; 1]), 245),
+            Set(Key(vec![108; 1]), 96),
+            Set(Key(vec![147; 1]), 44),
+            Set(Key(vec![102; 1]), 2),
+            Merge(Key(vec![22; 1]), 160),
+            Set(Key(vec![36; 1]), 1),
+            Set(Key(vec![65; 1]), 213),
+            Set(Key(vec![]), 221),
+            Set(Key(vec![84; 1]), 20),
+            Merge(Key(vec![229; 1]), 61),
+            Set(Key(vec![156; 1]), 69),
+            Merge(Key(vec![252; 1]), 85),
+            Set(Key(vec![36; 2]), 57),
+            Set(Key(vec![245; 1]), 143),
+            Set(Key(vec![59; 1]), 209),
+            GetGt(Key(vec![136; 1])),
+            Set(Key(vec![40; 1]), 96),
+            GetGt(Key(vec![59; 2]))
+        ],
+        false,
+        false,
+        0,
+        0
+    ))
 }

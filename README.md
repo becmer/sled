@@ -9,7 +9,7 @@
       </tr>
       <tr>
         <td><a href="https://github.com/sponsors/spacejam">buy a coffee for us to convert into databases</a></td>
-        <td><a href="https://github.com/sponsors/spacejam"><img src="https://img.shields.io/opencollective/backers/sled"></a></td>
+        <td><a href="https://github.com/sponsors/spacejam"><img src="https://img.shields.io/github/sponsors/spacejam"></a></td>
       </tr>
       <tr>
         <td><a href="https://docs.rs/sled">documentation</a></td>
@@ -23,7 +23,7 @@
   </td>
   <td>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/spacejam/sled/master/art/tree_face_anti-transphobia.png" width="40%" height="auto" />
+  <img src="https://raw.githubusercontent.com/spacejam/sled/main/art/tree_face_anti-transphobia.png" width="40%" height="auto" />
   </p>
   </td>
  </tr>
@@ -32,30 +32,88 @@
 
 # sled - ~~it's all downhill from here!!!~~
 
-A lightweight pure-rust high-performance transactional embedded database.
+An embedded database.
 
 ```rust
-let tree = sled::open("/tmp/welcome-to-sled").expect("open");
+let tree = sled::open("/tmp/welcome-to-sled")?;
 
 // insert and get, similar to std's BTreeMap
-tree.insert("KEY1", "VAL1");
-assert_eq!(tree.get(&"KEY1"), Ok(Some(sled::IVec::from("VAL1"))));
+let old_value = tree.insert("key", "value")?;
+
+assert_eq!(
+  tree.get(&"key")?,
+  Some(sled::IVec::from("value")),
+);
 
 // range queries
-for kv in tree.range("KEY1".."KEY9") {}
+for kv_result in tree.range("key_1".."key_9") {}
 
 // deletion
-tree.remove(&"KEY1");
+let old_value = tree.remove(&"key")?;
 
 // atomic compare and swap
-tree.compare_and_swap("KEY1", Some("VAL1"), Some("VAL2"));
+tree.compare_and_swap(
+  "key",
+  Some("current_value"),
+  Some("new_value"),
+)?;
 
 // block until all operations are stable on disk
 // (flush_async also available to get a Future)
-tree.flush();
+tree.flush()?;
 ```
 
 If you would like to work with structured data without paying expensive deserialization costs, check out the [structured](examples/structured.rs) example!
+
+# features
+
+* [API](https://docs.rs/sled) similar to a threadsafe `BTreeMap<[u8], [u8]>`
+* serializable (ACID) [transactions](https://docs.rs/sled/latest/sled/struct.Tree.html#method.transaction)
+  for atomically reading and writing to multiple keys in multiple keyspaces.
+* fully atomic single-key operations, including [compare and swap](https://docs.rs/sled/latest/sled/struct.Tree.html#method.compare_and_swap)
+* zero-copy reads
+* [write batches](https://docs.rs/sled/latest/sled/struct.Tree.html#method.apply_batch)
+* [subscribe to changes on key
+  prefixes](https://docs.rs/sled/latest/sled/struct.Tree.html#method.watch_prefix)
+* [multiple keyspaces](https://docs.rs/sled/latest/sled/struct.Db.html#method.open_tree)
+* [merge operators](https://docs.rs/sled/latest/sled/doc/merge_operators/index.html)
+* forward and reverse iterators over ranges of items
+* a crash-safe monotonic [ID generator](https://docs.rs/sled/latest/sled/struct.Db.html#method.generate_id)
+  capable of generating 75-125 million unique ID's per second
+* [zstd](https://github.com/facebook/zstd) compression (use the
+  `compression` build feature, disabled by default)
+* cpu-scalable lock-free implementation
+* flash-optimized log-structured storage
+* uses modern b-tree techniques such as prefix encoding and suffix
+  truncation for reducing the storage costs of long keys with shared
+  prefixes. If keys are the same length and sequential then the
+  system can avoid storing 99%+ of the key data in most cases,
+  essentially acting like a learned index
+
+# expectations, gotchas, advice
+
+* Maybe one of the first things that seems weird is the `IVec` type.
+  This is an inlinable `Arc`ed slice that makes some things more efficient.
+* Durability: **sled automatically fsyncs every 500ms by default**,
+  which can be configured with the `flush_every_ms` configurable, or you may
+  call `flush` / `flush_async` manually after operations.
+* **Transactions are optimistic** - do not interact with external state
+  or perform IO from within a transaction closure unless it is
+  [idempotent](https://en.wikipedia.org/wiki/Idempotent).
+* Internal tree node optimizations: sled performs prefix encoding
+  on long keys with similar prefixes that are grouped together in a range,
+  as well as suffix truncation to further reduce the indexing costs of
+  long keys. Nodes will skip potentially expensive length and offset pointers
+  if keys or values are all the same length (tracked separately, don't worry
+  about making keys the same length as values), so it may improve space usage
+  slightly if you use fixed-length keys or values. This also makes it easier
+  to use [structured access](examples/structured.rs) as well.
+* sled does not support multiple open instances for the time being. Please
+  keep sled open for the duration of your process's lifespan. It's totally
+  safe and often quite convenient to use a global lazy_static sled instance,
+  modulo the normal global variable trade-offs. Every operation is threadsafe,
+  and most are implemented under the hood with lock-free algorithms that avoid
+  blocking in hot paths.
 
 # performance
 
@@ -63,25 +121,6 @@ If you would like to work with structured data without paying expensive deserial
   with [traditional B+ tree](https://en.wikipedia.org/wiki/B%2B_tree)-like read performance
 * over a billion operations in under a minute at 95% read 5% writes on 16 cores on a small dataset
 * measure your own workloads rather than relying on some marketing for contrived workloads
-
-what's the trade-off? sled uses too much disk space sometimes. this will improve significantly before 1.0.
-
-# features
-
-* [API](https://docs.rs/sled) similar to a threadsafe `BTreeMap<[u8], [u8]>`
-* serializable multi-key and multi-Tree interactive [transactions](https://docs.rs/sled/latest/sled/struct.Tree.html#method.transaction)
-* fully atomic single-key operations, supports [compare and swap](https://docs.rs/sled/latest/sled/struct.Tree.html#method.compare_and_swap)
-* zero-copy reads
-* [write batch support](https://docs.rs/sled/latest/sled/struct.Tree.html#method.apply_batch)
-* [subscriber/watch semantics on key prefixes](https://github.com/spacejam/sled/wiki/reactive-semantics)
-* [multiple keyspace/Tree support](https://docs.rs/sled/latest/sled/struct.Db.html#method.open_tree)
-* [merge operators](https://github.com/spacejam/sled/wiki/merge-operators)
-* forward and reverse iterators
-* a crash-safe monotonic [ID generator](https://docs.rs/sled/latest/sled/struct.Db.html#method.generate_id) capable of generating 75-125 million unique ID's per second
-* [zstd](https://github.com/facebook/zstd) compression (use the `compression` build feature)
-* cpu-scalable lock-free implementation
-* flash-optimized log-structured storage
-* uses modern b-tree techniques such as prefix encoding and suffix truncation for reducing the storage costs of long keys
 
 # a note on lexicographic ordering and endianness
 
@@ -108,12 +147,10 @@ We support async subscription to events that happen on key prefixes, because the
 
 ```rust
 let sled = sled::open("my_db").unwrap();
+
 let mut sub = sled.watch_prefix("");
 
 sled.insert(b"a", b"a").unwrap();
-sled.insert(b"a", b"a").unwrap();
-
-drop(sled);
 
 extreme::run(async move {
     while let Some(event) = (&mut sub).await {
@@ -124,7 +161,7 @@ extreme::run(async move {
 
 # minimum supported Rust version (MSRV)
 
-We support Rust 1.39.0 and up.
+We support Rust 1.62 and up.
 
 # architecture
 
@@ -146,52 +183,16 @@ for a more detailed overview of where we're at and where we see things going!
 
 * if reliability is your primary constraint, use SQLite. sled is beta.
 * if storage price performance is your primary constraint, use RocksDB. sled uses too much space sometimes.
+* if you have a multi-process workload that rarely writes, use LMDB. sled is architected for use with long-running, highly-concurrent workloads such as stateful services or higher-level databases.
 * quite young, should be considered unstable for the time being.
 * the on-disk format is going to change in ways that require [manual migrations](https://docs.rs/sled/latest/sled/struct.Db.html#method.export) before the `1.0.0` release!
 
 # priorities
 
-* rework the transaction API to eliminate surprises and limitations
-* reduce space and memory usage
-* the 1.0.0 release date is January 19, 2021 (sled's 5th birthday)
-* combine merge operators with subscribers in a way that plays nicely with transactions
-* typed trees for low-friction serialization
-* replication support for both strongly and eventually consistent systems
-* continue to improve testing and make certain bug classes impossible through construction
-* continue to optimize the hell out of everything
-* continue to improve documentation and examples
-* continue to reduce compilation latency
+1. A full rewrite of sled's storage subsystem is happening on a modular basis as part of the [komora project](https://github.com/komora-io), in particular the marble storage engine. This will dramatically lower both the disk space usage (space amplification) and garbage collection overhead (write amplification) of sled.
+2. The memory layout of tree nodes is being completely rewritten to reduce fragmentation and eliminate serialization costs.
+3. The merge operator feature will change into a trigger feature that resembles traditional database triggers, allowing state to be modified as part of the same atomic writebatch that triggered it for retaining serializability with reactive semantics.
 
 # fund feature development
 
 Like what we're doing? Help us out via [GitHub Sponsors](https://github.com/sponsors/spacejam)!
-
-# special thanks
-
-<p align="center">
-  <a href="https://www.meilisearch.com/">
-    <img src="https://avatars3.githubusercontent.com/u/43250847?s=200&v=4" width="20%" height="auto" />
-  </a>
-</p>
-
-Special thanks to [Meili](https://www.meilisearch.com/) for providing engineering effort and other support to the sled project. They are building [an event store](https://blog.meilisearch.com/meilies-release/) backed by sled, and they offer [a full-text search system](https://github.com/meilisearch/MeiliDB) which has been a valuable case study helping to focus the sled roadmap for the future.
-
-<p align="center">
-  <a href="http://worksonarm.com">
-    <img src="https://user-images.githubusercontent.com/7989673/29498525-38a33f36-85cc-11e7-938d-ef6f10ba6fb3.png" width="20%" height="auto" />
-  </a>
-</p>
-
-Additional thanks to [Arm](https://www.arm.com/), [Works on Arm](https://www.worksonarm.com/) and [Packet](https://www.packet.com/), who have generously donated a 96 core monster machine to assist with intensive concurrency testing of sled. Each second that sled does not crash while running your critical stateful workloads, you are encouraged to thank these wonderful organizations. Each time sled does crash and lose your data, blame Intel.
-
-# contribution welcome!
-
-want to help advance the state of the art in open source embedded
-databases? check out [CONTRIBUTING.md](CONTRIBUTING.md)!
-
-# references
-
-* [The Bw-Tree: A B-tree for New Hardware Platforms](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/bw-tree-icde2013-final.pdf)
-* [LLAMA: A Cache/Storage Subsystem for Modern Hardware](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/llama-vldb2013.pdf)
-* [Cicada: Dependably Fast Multi-Core In-Memory Transactions](http://15721.courses.cs.cmu.edu/spring2018/papers/06-mvcc2/lim-sigmod2017.pdf)
-* [The Design and Implementation of a Log-Structured File System](https://people.eecs.berkeley.edu/~brewer/cs262/LFS.pdf)

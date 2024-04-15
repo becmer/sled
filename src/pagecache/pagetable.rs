@@ -8,13 +8,14 @@ use std::{
     sync::atomic::Ordering::{Acquire, Relaxed, Release},
 };
 
-use crossbeam_epoch::{pin, Atomic, Guard, Owned, Shared};
-
 use crate::{
     debug_delay,
+    ebr::{pin, Atomic, Guard, Owned, Shared},
     pagecache::{constants::MAX_PID_BITS, Page, PageView},
-    Measure, M,
 };
+
+#[cfg(feature = "metrics")]
+use crate::{Measure, M};
 
 #[allow(unused)]
 #[doc(hidden)]
@@ -130,24 +131,38 @@ impl PageTable {
     }
 
     /// Try to get a value from the tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the page has never been allocated.
     pub(crate) fn get<'g>(
         &self,
         pid: PageId,
         guard: &'g Guard,
-    ) -> Option<PageView<'g>> {
+    ) -> PageView<'g> {
+        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.get_pagetable);
         debug_delay();
         let tip = self.traverse(pid, guard);
 
         debug_delay();
         let res = tip.load(Acquire, guard);
-        if res.is_null() {
-            None
-        } else {
-            let page_view = PageView { read: res, entry: tip };
 
-            Some(page_view)
-        }
+        assert!(!res.is_null(), "tried to get pid {}", pid);
+
+        PageView { read: res, entry: tip }
+    }
+
+    pub(crate) fn contains_pid(&self, pid: PageId, guard: &Guard) -> bool {
+        #[cfg(feature = "metrics")]
+        let _measure = Measure::new(&M.get_pagetable);
+        debug_delay();
+        let tip = self.traverse(pid, guard);
+
+        debug_delay();
+        let res = tip.load(Acquire, guard);
+
+        !res.is_null()
     }
 
     fn traverse<'g>(&self, k: PageId, guard: &'g Guard) -> &'g Atomic<Page> {
@@ -175,7 +190,7 @@ impl PageTable {
             );
 
             l2_ptr = match ret {
-                Ok(next_child) => next_child,
+                Ok(l2) => l2,
                 Err(returned) => {
                     drop(returned.new);
                     returned.current
@@ -224,7 +239,7 @@ impl Drop for PageTable {
 }
 
 #[test]
-fn test_split_fanout() {
+fn fanout_functionality() {
     assert_eq!(
         split_fanout(0b11_1111_1111_1111_1111),
         (0, 0b11_1111_1111_1111_1111)

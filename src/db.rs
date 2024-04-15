@@ -2,34 +2,23 @@ use std::ops::Deref;
 
 use crate::*;
 
+const DEFAULT_TREE_ID: &[u8] = b"__sled__default";
+
 /// The `sled` embedded database! Implements
 /// `Deref<Target = sled::Tree>` to refer to
 /// a default keyspace / namespace / bucket.
+///
+/// When dropped, all buffered writes are flushed
+/// to disk, using the same method used by
+/// `Tree::flush`.
 #[derive(Clone)]
+#[doc(alias = "database")]
 pub struct Db {
     #[doc(hidden)]
     pub context: Context,
     pub(crate) default: Tree,
     tenants: Arc<RwLock<FastMap8<IVec, Tree>>>,
 }
-
-/// Opens a `Db` with a default configuration at the
-/// specified path. This will create a new storage
-/// directory at the specified path if it does
-/// not already exist. You can use the `Db::was_recovered`
-/// method to determine if your database was recovered
-/// from a previous instance. You can use `Config::create_new`
-/// if you want to increase the chances that the database
-/// will be freshly created.
-pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Db> {
-    Config::new().path(path).open()
-}
-
-#[allow(unsafe_code)]
-unsafe impl Send for Db {}
-
-#[allow(unsafe_code)]
-unsafe impl Sync for Db {}
 
 impl Deref for Db {
     type Target = Tree;
@@ -58,29 +47,13 @@ impl Debug for Db {
 }
 
 impl Db {
-    #[doc(hidden)]
-    #[deprecated(since = "0.30.2", note = "replaced by `sled::open`")]
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
-        Config::new().path(path).open()
-    }
-
     pub(crate) fn start_inner(config: RunningConfig) -> Result<Self> {
+        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.tree_start);
 
         let context = Context::start(config)?;
 
-        #[cfg(all(
-            not(miri),
-            any(
-                windows,
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-            )
-        ))]
+        #[cfg(not(miri))]
         {
             let flusher_pagecache = context.pagecache.clone();
             let flusher = context.flush_every_ms.map(move |fem| {
@@ -106,15 +79,15 @@ impl Db {
 
         let mut tenants = ret.tenants.write();
 
-        for (id, root) in context.pagecache.get_meta(&guard)?.tenants() {
+        for (id, root) in &context.pagecache.get_meta(&guard).inner {
             let tree = Tree(Arc::new(TreeInner {
                 tree_id: id.clone(),
                 subscribers: Subscribers::default(),
                 context: context.clone(),
-                root: AtomicU64::new(root),
+                root: AtomicU64::new(*root),
                 merge_operator: RwLock::new(None),
             }));
-            assert!(tenants.insert(id, tree).is_none());
+            assert!(tenants.insert(id.clone(), tree).is_none());
         }
 
         drop(tenants);
@@ -122,7 +95,7 @@ impl Db {
         #[cfg(feature = "event_log")]
         {
             for (_name, tree) in ret.tenants.read().iter() {
-                tree.verify_integrity().unwrap();
+                tree.verify_integrity()?;
             }
             ret.context.event_log.verify();
         }
@@ -134,11 +107,14 @@ impl Db {
     /// accessible from the `Db` via the provided identifier.
     pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<Tree> {
         let name_ref = name.as_ref();
-        let tenants = self.tenants.read();
-        if let Some(tree) = tenants.get(name_ref) {
-            return Ok(tree.clone());
+
+        {
+            let tenants = self.tenants.read();
+            if let Some(tree) = tenants.get(name_ref) {
+                return Ok(tree.clone());
+            }
+            drop(tenants);
         }
-        drop(tenants);
 
         let guard = pin();
 
@@ -157,23 +133,24 @@ impl Db {
         Ok(tree)
     }
 
-    /// Remove a disk-backed collection.
+    /// Remove a disk-backed collection. This is blocking and fairly slow.
     pub fn drop_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<bool> {
         let name_ref = name.as_ref();
         if name_ref == DEFAULT_TREE_ID {
-            return Err(Error::Unsupported(
-                "cannot remove the core structures".into(),
-            ));
+            return Err(Error::Unsupported("cannot remove the default tree"));
         }
         trace!("dropping tree {:?}", name_ref,);
 
         let mut tenants = self.tenants.write();
 
-        let tree = if let Some(tree) = tenants.remove(&*name_ref) {
+        let tree = if let Some(tree) = tenants.remove(name_ref) {
             tree
         } else {
             return Ok(false);
         };
+
+        // signal to all threads that this tree is no longer valid
+        tree.root.store(u64::max_value(), SeqCst);
 
         let guard = pin();
 
@@ -183,8 +160,8 @@ impl Db {
         let mut leftmost_chain: Vec<PageId> = vec![root_id.unwrap()];
         let mut cursor = root_id.unwrap();
         while let Some(view) = self.view_for_pid(cursor, &guard)? {
-            if let Some(index) = view.data.index_ref() {
-                let leftmost_child = index.pointers[0];
+            if view.is_index {
+                let leftmost_child = view.iter_index_pids().next().unwrap();
                 leftmost_chain.push(leftmost_child);
                 cursor = leftmost_child;
             } else {
@@ -205,16 +182,63 @@ impl Db {
             }
         }
 
-        tree.root.store(u64::max_value(), SeqCst);
-
-        // drop writer lock
+        // drop writer lock and asynchronously
         drop(tenants);
-
-        tree.gc_pages(leftmost_chain)?;
 
         guard.flush();
 
+        drop(guard);
+
+        self.gc_pages(leftmost_chain)?;
+
         Ok(true)
+    }
+
+    // Remove all pages for this tree from the underlying
+    // PageCache. This will leave orphans behind if
+    // the tree crashes during gc.
+    fn gc_pages(&self, mut leftmost_chain: Vec<PageId>) -> Result<()> {
+        let mut guard = pin();
+
+        let mut ops = 0;
+        while let Some(mut pid) = leftmost_chain.pop() {
+            loop {
+                ops += 1;
+                if ops % 64 == 0 {
+                    // we re-pin here to avoid memory blow-ups during
+                    // long-running tree removals.
+                    guard = pin();
+                }
+                let cursor_view =
+                    if let Some(view) = self.view_for_pid(pid, &guard)? {
+                        view
+                    } else {
+                        trace!(
+                            "encountered Free node pid {} while GC'ing tree",
+                            pid
+                        );
+                        break;
+                    };
+
+                let ret = self.context.pagecache.free(
+                    pid,
+                    cursor_view.node_view.0,
+                    &guard,
+                )?;
+
+                if ret.is_ok() {
+                    let next_pid = if let Some(next_pid) = cursor_view.next {
+                        next_pid
+                    } else {
+                        break;
+                    };
+                    assert_ne!(pid, next_pid.get());
+                    pid = next_pid.get();
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns the trees names saved in this Db.
@@ -280,16 +304,20 @@ impl Db {
     /// ```
     /// # use sled as old_sled;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-    /// let old = old_sled::open("my_old_db")?;
+    /// let old = old_sled::open("my_old__db")?;
     ///
     /// // may be a different version of sled,
     /// // the export type is version agnostic.
-    /// let new = sled::open("my_new_db")?;
+    /// let new = sled::open("my_new__db")?;
     ///
     /// let export = old.export();
     /// new.import(export);
     ///
     /// assert_eq!(old.checksum()?, new.checksum()?);
+    /// # drop(old);
+    /// # drop(new);
+    /// # std::fs::remove_file("my_old__db");
+    /// # std::fs::remove_file("my_new__db");
     /// # Ok(()) }
     /// ```
     pub fn export(
@@ -352,6 +380,10 @@ impl Db {
     /// new.import(export);
     ///
     /// assert_eq!(old.checksum()?, new.checksum()?);
+    /// # drop(old);
+    /// # drop(new);
+    /// # std::fs::remove_file("my_old_db");
+    /// # std::fs::remove_file("my_new_db");
     /// # Ok(()) }
     /// ```
     pub fn import(
@@ -403,9 +435,6 @@ impl Db {
         let tenants: BTreeMap<_, _> = tenants_mu.iter().collect();
 
         let mut hasher = crc32fast::Hasher::new();
-        let mut locks = vec![];
-
-        locks.push(concurrency_control::write());
 
         for (name, tree) in &tenants {
             hasher.update(name);
@@ -434,6 +463,12 @@ impl Db {
     #[doc(hidden)]
     pub fn space_amplification(&self) -> Result<f64> {
         self.context.pagecache.space_amplification()
+    }
+
+    /// Returns a true value if one of the tree names linked
+    /// to the database is found, if not a false will be returned.
+    pub fn contains_tree<V: AsRef<[u8]>>(&self, name: V) -> bool {
+        self.tenants.read().contains_key(name.as_ref())
     }
 }
 

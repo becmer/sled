@@ -11,14 +11,10 @@ pub const MAX_MSG_HEADER_LEN: usize = 32;
 /// Log segments have a header of this length.
 pub const SEG_HEADER_LEN: usize = 20;
 
-/// The minimum number of items per segment.
-/// Items larger than this fraction of an `io_buf`
-/// will be stored as an off-log blob.
-pub const MINIMUM_ITEMS_PER_SEGMENT: usize = 4;
-
 /// During testing, this should never be exceeded.
+// TODO drop this to 3 over time
 #[allow(unused)]
-pub const MAX_SPACE_AMPLIFICATION: f64 = 5.;
+pub const MAX_SPACE_AMPLIFICATION: f64 = 10.;
 
 pub(crate) const META_PID: PageId = 0;
 pub(crate) const COUNTER_PID: PageId = 1;
@@ -39,3 +35,11 @@ pub(crate) const MAX_PID_BITS: usize = 37;
 // Assumed to be enough for a 32-bit system.
 #[cfg(target_pointer_width = "32")]
 pub(crate) const MAX_PID_BITS: usize = 32;
+
+// Limit keys and values to 128gb on 64-bit systems.
+#[cfg(target_pointer_width = "64")]
+pub(crate) const MAX_BLOB: usize = 1 << 37;
+
+// Limit keys and values to 512mb on 32-bit systems.
+#[cfg(target_pointer_width = "32")]
+pub(crate) const MAX_BLOB: usize = 1 << 29;

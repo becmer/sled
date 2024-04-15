@@ -29,6 +29,9 @@
 #![allow(unused_results)]
 #![allow(clippy::print_stdout)]
 #![allow(clippy::float_arithmetic)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
 
 use std::convert::TryFrom;
 use std::fmt::{self, Debug};
@@ -64,10 +67,11 @@ impl Default for Histogram {
             // Avoid calling Vec::resize_with with a large length because its
             // internals cause stacked borrows tracking information to add an
             // item for each element of the vector.
-            let mut vals = std::mem::ManuallyDrop::new(vec![0_usize; BUCKETS]);
-            let ptr: *mut usize = vals.as_mut_ptr();
-            let len = vals.len();
-            let capacity = vals.capacity();
+            let mut raw_vals =
+                std::mem::ManuallyDrop::new(vec![0_usize; BUCKETS]);
+            let ptr: *mut usize = raw_vals.as_mut_ptr();
+            let len = raw_vals.len();
+            let capacity = raw_vals.capacity();
 
             let vals: Vec<AtomicUsize> = unsafe {
                 Vec::from_raw_parts(ptr as *mut AtomicUsize, len, capacity)
@@ -81,9 +85,6 @@ impl Default for Histogram {
         }
     }
 }
-
-#[allow(unsafe_code)]
-unsafe impl Send for Histogram {}
 
 impl Debug for Histogram {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
@@ -105,7 +106,7 @@ impl Histogram {
     /// Record a value.
     #[inline]
     pub fn measure(&self, raw_value: u64) {
-        #[cfg(not(feature = "no_metrics"))]
+        #[cfg(feature = "metrics")]
         {
             let value_float: f64 = raw_value as f64;
             self.sum.fetch_add(value_float.round() as usize, Ordering::Relaxed);
@@ -124,7 +125,7 @@ impl Histogram {
     /// Retrieve a percentile [0-100]. Returns NAN if no metrics have been
     /// collected yet.
     pub fn percentile(&self, p: f64) -> f64 {
-        #[cfg(not(feature = "no_metrics"))]
+        #[cfg(feature = "metrics")]
         {
             assert!(p <= 100., "percentiles must not exceed 100.0");
 
@@ -142,8 +143,7 @@ impl Histogram {
             let mut sum = 0.;
 
             for (idx, val) in self.vals.iter().enumerate() {
-                let count = val.load(Ordering::Acquire);
-                sum += count as f64;
+                sum += val.load(Ordering::Acquire) as f64;
 
                 if sum >= target {
                     return decompress(idx as u16);
@@ -196,7 +196,7 @@ fn decompress(compressed: u16) -> f64 {
     (unboosted.exp() - 1.)
 }
 
-#[cfg(not(feature = "no_metrics"))]
+#[cfg(feature = "metrics")]
 #[test]
 fn it_works() {
     let c = Histogram::default();
@@ -214,7 +214,7 @@ fn it_works() {
     c.print_percentiles();
 }
 
-#[cfg(not(feature = "no_metrics"))]
+#[cfg(feature = "metrics")]
 #[test]
 fn high_percentiles() {
     let c = Histogram::default();
@@ -239,7 +239,7 @@ fn high_percentiles() {
     assert_eq!(c.percentile(100.).round() as usize, 502);
 }
 
-#[cfg(not(feature = "no_metrics"))]
+#[cfg(feature = "metrics")]
 #[test]
 fn multithreaded() {
     use std::sync::Arc;
@@ -255,7 +255,7 @@ fn multithreaded() {
         }));
     }
 
-    for t in threads.into_iter() {
+    for t in threads {
         t.join().unwrap();
     }
 

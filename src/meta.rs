@@ -26,20 +26,6 @@ impl Meta {
     pub(crate) fn del_root(&mut self, name: &[u8]) -> Option<PageId> {
         self.inner.remove(name)
     }
-
-    /// Return the current rooted tenants in Meta
-    pub(crate) fn tenants(&self) -> BTreeMap<IVec, PageId> {
-        self.inner.clone()
-    }
-
-    pub(crate) fn rss(&self) -> u64 {
-        self.inner
-            .iter()
-            .map(|(k, _pid)| {
-                k.len() as u64 + std::mem::size_of::<PageId>() as u64
-            })
-            .sum()
-    }
 }
 
 /// Open or create a new disk-backed Tree with its own keyspace,
@@ -59,6 +45,7 @@ where
     loop {
         match context.pagecache.meta_pid_for_name(&name, guard) {
             Ok(root_id) => {
+                assert_ne!(root_id, 0);
                 return Ok(Tree(Arc::new(TreeInner {
                     tree_id: name,
                     context: context.clone(),
@@ -67,12 +54,12 @@ where
                     merge_operator: RwLock::new(None),
                 })));
             }
-            Err(Error::CollectionNotFound(_)) => {}
+            Err(Error::CollectionNotFound) => {}
             Err(other) => return Err(other),
         }
 
         // set up empty leaf
-        let leaf = Node::default();
+        let leaf = Node::new_empty_leaf();
         let (leaf_id, leaf_ptr) = context.pagecache.allocate(leaf, guard)?;
 
         trace!(

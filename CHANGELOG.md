@@ -1,3 +1,68 @@
+# Unreleased
+
+## New Features
+
+* #1178 batches and transactions are now unified for subscribers.
+* #1231 `Tree::get_zero_copy` allows for reading a value directly
+  in-place without making an `IVec` first.
+* #1250 the global `print_profile` function has been added
+  which is enabled when compiling with the `metrics` feature.
+* #1254 `IVec` data will now always have an alignment of 8,
+  which may enable interesting architecture-specific use cases.
+* #1307 & #1315 `Db::contains_tree` can be used to see if a
+  `Tree` with a given name already exists.
+
+## Improvements
+
+* #1214 a new slab-style storage engine has been added which
+  replaces the previous file-per-blob technique for storing
+  large pages.
+* #1231 tree nodes now get merged into a single-allocation
+  representation that is able to dynamically avoid various
+  overheads, resulting in significant efficiency improvements.
+
+## Breaking Changes
+
+* #1400 Bump MSRV to 1.57.
+* #1399 Thread support is now required on all platforms.
+* #1135 The "no_metrics" anti-feature has been replaced with
+  the "metrics" positive feature.
+* #1178 the `Event` enum has become a unified struct that allows
+  subscribers to iterate over each (Tree, key, optional value)
+  involved in single key operations, batches, or transactions in
+  a unified way.
+* #1178 the `Event::key` method has been removed in favor of the
+  new more comprehensive `iter` method.
+* #1214 The deprecated `Config::build` method has been removed.
+* #1248 The deprecated `Tree::set` method has been removed.
+* #1248 The deprecated `Tree::del` method has been removed.
+* #1250 The `Config::print_profile_on_drop` method has been
+  removed in favor of the global `print_profile` function.
+* #1252 The deprecated `Db::open` method has been removed.
+* #1252 The deprecated `Config::segment_cleanup_skew` method
+  has been removed.
+* #1252 The deprecated `Config::segment_cleanup_threshold`
+  method has been removed.
+* #1252 The deprecated `Config::snapshot_path` method has
+  been removed.
+* #1253 The `IVec::subslice` method has been removed.
+* #1275 Keys and values are now limited to 128gb on 64-bit
+  platforms and 512mb on 32-bit platforms.
+* #1281 `Config`'s `cache_capacity` is now a usize, as u64
+  doesn't make sense for things that must fit in memory anyway.
+* #1314 `Subscriber::next_timeout` now requires a mutable self
+  reference.
+* #1349 The "measure_allocs" feature has been removed.
+* #1354 `Error` has been modified to be Copy, removing all
+  heap-allocated variants.
+
+## Bug Fixes
+
+* #1202 Fix a space leak where blobs were not
+  removed when replaced by another blob.
+* #1229 the powerful ALICE crash consistency tool has been
+  used to discover several crash vulnerabilities, now fixed.
+
 # 0.34.7
 
 ## Bug Fixes
