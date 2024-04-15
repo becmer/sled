@@ -3,7 +3,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::atomic::{
         AtomicBool,
-        Ordering::{AcqRel, Acquire, Release},
+        Ordering::{Acquire, Release},
     },
 };
 
@@ -37,33 +37,19 @@ impl<'a, T> DerefMut for FastLockGuard<'a, T> {
     }
 }
 
-#[repr(C)]
 pub struct FastLock<T> {
-    inner: UnsafeCell<T>,
     lock: AtomicBool,
+    inner: UnsafeCell<T>,
 }
 
-#[allow(unsafe_code)]
-unsafe impl<T: Send> Sync for FastLock<T> {}
-
-#[allow(unsafe_code)]
-unsafe impl<T: Send> Send for FastLock<T> {}
-
 impl<T> FastLock<T> {
-    pub const fn new(inner: T) -> FastLock<T> {
+    pub fn new(inner: T) -> FastLock<T> {
         FastLock { lock: AtomicBool::new(false), inner: UnsafeCell::new(inner) }
     }
 
     pub fn try_lock(&self) -> Option<FastLockGuard<'_, T>> {
-        let lock_result =
-            self.lock.compare_exchange_weak(false, true, AcqRel, Acquire);
+        let lock_result = self.lock.compare_exchange(false, true, Acquire, Acquire);
 
-        let success = lock_result.is_ok();
-
-        if success {
-            Some(FastLockGuard { mu: self })
-        } else {
-            None
-        }
+        if lock_result.is_ok() { Some(FastLockGuard { mu: self }) } else { None }
     }
 }

@@ -1,4 +1,4 @@
-#[cfg(feature = "for-internal-testing-only")]
+#[cfg(feature = "testing")]
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 
@@ -6,7 +6,7 @@ use parking_lot::{RwLockReadGuard, RwLockWriteGuard};
 
 use super::*;
 
-#[cfg(feature = "for-internal-testing-only")]
+#[cfg(feature = "testing")]
 thread_local! {
     pub static COUNT: RefCell<u32> = RefCell::new(0);
 }
@@ -31,6 +31,7 @@ fn init_cc() -> ConcurrencyControl {
 
 #[derive(Debug)]
 #[must_use]
+#[allow(dead_code)]
 pub(crate) enum Protector<'a> {
     Write(RwLockWriteGuard<'a, ()>),
     Read(RwLockReadGuard<'a, ()>),
@@ -42,7 +43,7 @@ impl<'a> Drop for Protector<'a> {
         if let Protector::None(active) = self {
             active.fetch_sub(1, Release);
         }
-        #[cfg(feature = "for-internal-testing-only")]
+        #[cfg(feature = "testing")]
         COUNT.with(|c| {
             let mut c = c.borrow_mut();
             *c -= 1;
@@ -64,16 +65,14 @@ impl ConcurrencyControl {
         if self.active.fetch_or(RW_REQUIRED_BIT, SeqCst) < RW_REQUIRED_BIT {
             // we are the first to set this bit
             while self.active.load(Acquire) != RW_REQUIRED_BIT {
-                // `hint::spin_loop` requires Rust 1.49.
-                #[allow(deprecated)]
-                std::sync::atomic::spin_loop_hint()
+                std::hint::spin_loop()
             }
             self.upgrade_complete.store(true, Release);
         }
     }
 
     fn read(&self) -> Protector<'_> {
-        #[cfg(feature = "for-internal-testing-only")]
+        #[cfg(feature = "testing")]
         COUNT.with(|c| {
             let mut c = c.borrow_mut();
             *c += 1;
@@ -91,7 +90,7 @@ impl ConcurrencyControl {
     }
 
     fn write(&self) -> Protector<'_> {
-        #[cfg(feature = "for-internal-testing-only")]
+        #[cfg(feature = "testing")]
         COUNT.with(|c| {
             let mut c = c.borrow_mut();
             *c += 1;
@@ -99,9 +98,7 @@ impl ConcurrencyControl {
         });
         self.enable();
         while !self.upgrade_complete.load(Acquire) {
-            // `hint::spin_loop` requires Rust 1.49.
-            #[allow(deprecated)]
-            std::sync::atomic::spin_loop_hint()
+            std::hint::spin_loop()
         }
         Protector::Write(self.rw.write())
     }

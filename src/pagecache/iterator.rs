@@ -1,9 +1,8 @@
-use std::{collections::BTreeMap, io};
+use std::io;
 
 use super::{
-    pread_exact_or_eof, read_message, read_segment_header, BasedBuf, DiskPtr,
-    LogKind, LogOffset, LogRead, Lsn, SegmentHeader, SegmentNumber,
-    MAX_MSG_HEADER_LEN, SEG_HEADER_LEN,
+    pread_exact_or_eof, read_message, read_segment_header, BasedBuf,
+    SegmentHeader, SegmentNumber,
 };
 use crate::*;
 

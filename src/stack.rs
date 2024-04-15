@@ -3,13 +3,12 @@
 use std::{
     fmt::{self, Debug},
     ops::Deref,
-    sync::atomic::Ordering::{Acquire, Release},
+    sync::atomic::Ordering::{Acquire, Relaxed, Release},
 };
 
-use crate::{
-    debug_delay,
-    ebr::{pin, Atomic, Guard, Owned, Shared},
-};
+use crossbeam_epoch::{unprotected, Atomic, Guard, Owned, Shared};
+
+use crate::debug_delay;
 
 /// A node in the lock-free `Stack`.
 #[derive(Debug)]
@@ -21,14 +20,13 @@ pub struct Node<T: Send + 'static> {
 impl<T: Send + 'static> Drop for Node<T> {
     fn drop(&mut self) {
         unsafe {
-            let guard = pin();
-            let mut cursor = self.next.load(Acquire, &guard);
+            let mut cursor = self.next.load(Acquire, unprotected());
 
             while !cursor.is_null() {
                 // we carefully unset the next pointer here to avoid
                 // a stack overflow when freeing long lists.
                 let node = cursor.into_owned();
-                cursor = node.next.swap(Shared::null(), Acquire, &guard);
+                cursor = node.next.swap(Shared::null(), Acquire, unprotected());
                 drop(node);
             }
         }
@@ -50,8 +48,7 @@ impl<T: Send + 'static> Default for Stack<T> {
 impl<T: Send + 'static> Drop for Stack<T> {
     fn drop(&mut self) {
         unsafe {
-            let guard = pin();
-            let curr = self.head.load(Acquire, &guard);
+            let curr = self.head.load(Acquire, unprotected());
             if !curr.as_raw().is_null() {
                 drop(curr.into_owned());
             }
@@ -67,7 +64,7 @@ where
         &self,
         formatter: &mut fmt::Formatter<'_>,
     ) -> Result<(), fmt::Error> {
-        let guard = pin();
+        let guard = crossbeam_epoch::pin();
         let head = self.head(&guard);
         let iter = Iter::from_ptr(head, &guard);
 
@@ -97,18 +94,15 @@ impl<T: Send + Sync + 'static> Stack<T> {
     /// Add an item to the stack, spinning until successful.
     pub(crate) fn push(&self, inner: T, guard: &Guard) {
         debug_delay();
-        let node_owned = Owned::new(Node { inner, next: Atomic::null() });
+        let node = Owned::new(Node { inner, next: Atomic::null() });
 
         unsafe {
-            let node_shared = node_owned.into_shared(guard);
+            let node = node.into_shared(guard);
 
             loop {
                 let head = self.head(guard);
-                node_shared.deref().next.store(head, Release);
-                if self
-                    .head
-                    .compare_and_set(head, node_shared, Release, guard)
-                    .is_ok()
+                node.deref().next.store(head, Release);
+                if self.head.compare_exchange(head, node, Release, Relaxed, guard).is_ok()
                 {
                     return;
                 }
@@ -136,6 +130,7 @@ impl<T: Send + Sync + 'static> Stack<T> {
     }
 
     /// Pop the next item off the stack. Returns None if nothing is there.
+    #[cfg(any(test, feature = "event_log"))]
     pub(crate) fn pop(&self, guard: &Guard) -> Option<T> {
         use std::ptr;
         use std::sync::atomic::Ordering::SeqCst;
@@ -145,7 +140,7 @@ impl<T: Send + Sync + 'static> Stack<T> {
             match unsafe { head.as_ref() } {
                 Some(h) => {
                     let next = h.next.load(Acquire, guard);
-                    match self.head.compare_and_set(head, next, Release, guard)
+                    match self.head.compare_exchange(head, next, Release, Relaxed, guard)
                     {
                         Ok(_) => unsafe {
                             // we unset the next pointer before destruction
@@ -154,7 +149,7 @@ impl<T: Send + Sync + 'static> Stack<T> {
                             guard.defer_destroy(head);
                             return Some(ptr::read(&h.inner));
                         },
-                        Err(actual) => head = actual.current,
+                        Err(h) => head = h.current,
                     }
                 }
                 None => return None,
@@ -228,8 +223,8 @@ where
 #[test]
 #[cfg(not(miri))] // can't create threads
 fn basic_functionality() {
-    use crate::pin;
-    use crate::CachePadded;
+    use crossbeam_epoch::pin;
+    use crossbeam_utils::CachePadded;
     use std::sync::Arc;
     use std::thread;
 

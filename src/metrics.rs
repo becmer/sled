@@ -1,22 +1,14 @@
 #![allow(unused_results)]
-#![allow(clippy::cast_precision_loss)]
-#![allow(clippy::cast_possible_truncation)]
-#![allow(clippy::float_arithmetic)]
-
-use std::sync::atomic::AtomicUsize;
+#![allow(clippy::print_stdout)]
 
 #[cfg(not(target_arch = "x86_64"))]
 use std::time::{Duration, Instant};
 
-#[cfg(not(feature = "metrics"))]
+#[cfg(feature = "no_metrics")]
 use std::marker::PhantomData;
 
-#[cfg(feature = "metrics")]
+#[cfg(not(feature = "no_metrics"))]
 use std::sync::atomic::Ordering::{Acquire, Relaxed};
-
-use num_format::{Locale, ToFormattedString};
-
-use crate::Lazy;
 
 use super::*;
 
@@ -26,7 +18,7 @@ pub static M: Lazy<Metrics, fn() -> Metrics> = Lazy::new(Metrics::default);
 
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn clock() -> u64 {
-    if cfg!(not(feature = "metrics")) {
+    if cfg!(feature = "no_metrics") {
         0
     } else {
         #[cfg(target_arch = "x86_64")]
@@ -49,7 +41,7 @@ pub(crate) fn clock() -> u64 {
 pub(crate) fn uptime() -> Duration {
     static START: Lazy<Instant, fn() -> Instant> = Lazy::new(Instant::now);
 
-    if cfg!(not(feature = "metrics")) {
+    if cfg!(feature = "no_metrics") {
         Duration::new(0, 0)
     } else {
         START.elapsed()
@@ -58,22 +50,23 @@ pub(crate) fn uptime() -> Duration {
 
 /// Measure the duration of an event, and call `Histogram::measure()`.
 pub struct Measure<'h> {
-    start: u64,
+    _start: u64,
+    #[cfg(not(feature = "no_metrics"))]
     histo: &'h Histogram,
-    #[cfg(not(feature = "metrics"))]
+    #[cfg(feature = "no_metrics")]
     _pd: PhantomData<&'h ()>,
 }
 
 impl<'h> Measure<'h> {
     /// The time delta from ctor to dtor is recorded in `histo`.
     #[inline]
-    #[allow(unused_variables)]
-    pub fn new(histo: &'h Histogram) -> Measure<'h> {
+    pub fn new(_histo: &'h Histogram) -> Measure<'h> {
         Measure {
-            #[cfg(not(feature = "metrics"))]
+            #[cfg(feature = "no_metrics")]
             _pd: PhantomData,
-            histo,
-            start: clock(),
+            #[cfg(not(feature = "no_metrics"))]
+            histo: _histo,
+            _start: clock(),
         }
     }
 }
@@ -81,8 +74,8 @@ impl<'h> Measure<'h> {
 impl<'h> Drop for Measure<'h> {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(feature = "metrics")]
-        self.histo.measure(clock() - self.start);
+        #[cfg(not(feature = "no_metrics"))]
+        self.histo.measure(clock() - self._start);
     }
 }
 
@@ -94,15 +87,8 @@ pub struct Metrics {
     pub accountant_mark_link: Histogram,
     pub accountant_mark_replace: Histogram,
     pub accountant_next: Histogram,
-    pub accountant_stabilize: Histogram,
     pub advance_snapshot: Histogram,
     pub assign_offset: Histogram,
-    pub bytes_written_heap_item: CachePadded<AtomicUsize>,
-    pub bytes_written_heap_ptr: CachePadded<AtomicUsize>,
-    pub bytes_written_replace: CachePadded<AtomicUsize>,
-    pub bytes_written_link: CachePadded<AtomicUsize>,
-    pub bytes_written_other: CachePadded<AtomicUsize>,
-    pub fuzzy_snapshot: Histogram,
     pub compress: Histogram,
     pub decompress: Histogram,
     pub deserialize: Histogram,
@@ -145,8 +131,13 @@ pub struct Metrics {
     pub tree_traverse: Histogram,
     pub write_to_log: Histogram,
     pub written_bytes: Histogram,
+    #[cfg(feature = "measure_allocs")]
+    pub allocations: CachePadded<AtomicUsize>,
+    #[cfg(feature = "measure_allocs")]
+    pub allocated_bytes: CachePadded<AtomicUsize>,
 }
 
+#[cfg(not(feature = "no_metrics"))]
 impl Metrics {
     #[inline]
     pub fn tree_looped(&self) {
@@ -193,38 +184,34 @@ impl Metrics {
         self.tree_root_split_success.fetch_add(1, Relaxed);
     }
 
-    pub fn format_profile(&self) -> String {
-        let mut ret = String::new();
-        ret.push_str(&format!(
-                "sled profile:\n\
-             {0: >17} | {1: >10} | {2: >10} | {3: >10} | {4: >10} | {5: >10} | {6: >10} | {7: >10} | {8: >10} | {9: >10}\n",
-             "op",
-             "min (us)",
-             "med (us)",
-             "90 (us)",
-             "99 (us)",
-             "99.9 (us)",
-             "99.99 (us)",
-             "max (us)",
-             "count",
-             "sum (s)"
-             ));
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
+    pub fn print_profile(&self) {
+        println!(
+            "sled profile:\n\
+             {0: >17} | {1: >10} | {2: >10} | {3: >10} | {4: >10} | {5: >10} | {6: >10} | {7: >10} | {8: >10} | {9: >10}",
+            "op",
+            "min (us)",
+            "med (us)",
+            "90 (us)",
+            "99 (us)",
+            "99.9 (us)",
+            "99.99 (us)",
+            "max (us)",
+            "count",
+            "sum (s)"
+        );
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
 
-        let p =
-            |mut tuples: Vec<(String, _, _, _, _, _, _, _, _, _)>| -> String {
-                tuples.sort_by_key(|t| (t.9 * -1. * 1e3) as i64);
-                let mut to_ret = String::new();
-                for v in tuples {
-                    to_ret.push_str(&format!(
-                        "{0: >17} | {1: >10.1} | {2: >10.1} | {3: >10.1} \
+        let p = |mut tuples: Vec<(String, _, _, _, _, _, _, _, _, _)>| {
+            tuples.sort_by_key(|t| (t.9 * -1. * 1e3) as i64);
+            for v in tuples {
+                println!(
+                    "{0: >17} | {1: >10.1} | {2: >10.1} | {3: >10.1} \
                      | {4: >10.1} | {5: >10.1} | {6: >10.1} | {7: >10.1} \
-                     | {8: >10.1} | {9: >10.1}\n",
-                        v.0, v.1, v.2, v.3, v.4, v.5, v.6, v.7, v.8, v.9,
-                    ));
-                }
-                to_ret
-            };
+                     | {8: >10.1} | {9: >10.3}",
+                    v.0, v.1, v.2, v.3, v.4, v.5, v.6, v.7, v.8, v.9,
+                );
+            }
+        };
 
         let lat = |name: &str, histo: &Histogram| {
             (
@@ -256,9 +243,8 @@ impl Metrics {
             )
         };
 
-        ret.push_str("tree:\n");
-
-        ret.push_str(&p(vec![
+        println!("tree:");
+        p(vec![
             lat("traverse", &self.tree_traverse),
             lat("get", &self.tree_get),
             lat("set", &self.tree_set),
@@ -267,7 +253,7 @@ impl Metrics {
             lat("cas", &self.tree_cas),
             lat("scan", &self.tree_scan),
             lat("rev scan", &self.tree_reverse_scan),
-        ]));
+        ]);
         let total_loops = self.tree_loops.load(Acquire);
         let total_ops = self.tree_get.count()
             + self.tree_set.count()
@@ -277,35 +263,23 @@ impl Metrics {
             + self.tree_scan.count()
             + self.tree_reverse_scan.count();
         let loop_pct = total_loops * 100 / (total_ops + 1);
-        ret.push_str(&format!(
-            "tree contention loops: {} ({}% retry rate)\n",
+        println!(
+            "tree contention loops: {} ({}% retry rate)",
             total_loops, loop_pct
-        ));
-        ret.push_str(&format!(
-                "tree split success rates: child({}/{}) parent({}/{}) root({}/{})\n",
-                self.tree_child_split_success.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                self.tree_child_split_attempt.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                self.tree_parent_split_success.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                self.tree_parent_split_attempt.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                self.tree_root_split_success.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                self.tree_root_split_attempt.load(Acquire)
-                .to_formatted_string(&Locale::en)
-                ,
-                ));
+        );
+        println!(
+            "tree split success rates: child({}/{}) parent({}/{}) root({}/{})",
+            self.tree_child_split_success.load(Acquire),
+            self.tree_child_split_attempt.load(Acquire),
+            self.tree_parent_split_success.load(Acquire),
+            self.tree_parent_split_attempt.load(Acquire),
+            self.tree_root_split_success.load(Acquire),
+            self.tree_root_split_attempt.load(Acquire),
+        );
 
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
-        ret.push_str("pagecache:\n");
-        ret.push_str(&p(vec![
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
+        println!("pagecache:");
+        p(vec![
             lat("get", &self.get_page),
             lat("get pt", &self.get_pagetable),
             lat("rewrite", &self.rewrite_page),
@@ -313,22 +287,25 @@ impl Metrics {
             lat("link", &self.link_page),
             lat("pull", &self.pull),
             lat("page_out", &self.page_out),
-        ]));
-        let hit_ratio = self.get_page.count().saturating_sub(self.pull.count())
-            * 100
+        ]);
+        let hit_ratio = (self.get_page.count() - self.pull.count()) * 100
             / (self.get_page.count() + 1);
-        ret.push_str(&format!("hit ratio: {}%\n", hit_ratio));
+        println!("hit ratio: {}%", hit_ratio);
 
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
-        ret.push_str("serialization:\n");
-        ret.push_str(&p(vec![
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
+        println!("serialization and compression:");
+        p(vec![
             lat("serialize", &self.serialize),
             lat("deserialize", &self.deserialize),
-        ]));
+            #[cfg(feature = "compression")]
+            lat("compress", &self.compress),
+            #[cfg(feature = "compression")]
+            lat("decompress", &self.decompress),
+        ]);
 
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
-        ret.push_str("log:\n");
-        ret.push_str(&p(vec![
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
+        println!("log:");
+        p(vec![
             lat("make_stable", &self.make_stable),
             lat("read", &self.read),
             lat("write", &self.write_to_log),
@@ -336,72 +313,35 @@ impl Metrics {
             lat("assign offset", &self.assign_offset),
             lat("reserve lat", &self.reserve_lat),
             sz("reserve sz", &self.reserve_sz),
-        ]));
+        ]);
         let log_reservations =
             std::cmp::max(1, self.log_reservations.load(Acquire));
         let log_reservation_attempts =
             std::cmp::max(1, self.log_reservation_attempts.load(Acquire));
         let log_reservation_retry_rate =
-            log_reservation_attempts.saturating_sub(log_reservations) * 100
+            (log_reservation_attempts - log_reservations) * 100
                 / (log_reservations + 1);
-        ret.push_str(&format!(
-            "log reservations:             {:>15}\n",
-            log_reservations.to_formatted_string(&Locale::en)
-        ));
-        ret.push_str(&format!(
-            "log res attempts:             {:>15} ({}% retry rate)\n",
-            log_reservation_attempts.to_formatted_string(&Locale::en),
-            log_reservation_retry_rate,
-        ));
+        println!("log reservations: {}", log_reservations);
+        println!(
+            "log res attempts: {}, ({}% retry rate)",
+            log_reservation_attempts, log_reservation_retry_rate,
+        );
 
-        ret.push_str(&format!(
-            "heap item reserved bytes:     {:>15}\n",
-            self.bytes_written_heap_item
-                .load(Acquire)
-                .to_formatted_string(&Locale::en)
-        ));
-        ret.push_str(&format!(
-            "heap pointer reserved bytes:  {:>15}\n",
-            self.bytes_written_heap_ptr
-                .load(Acquire)
-                .to_formatted_string(&Locale::en)
-        ));
-        ret.push_str(&format!(
-            "node replace reserved bytes:  {:>15}\n",
-            self.bytes_written_replace
-                .load(Acquire)
-                .to_formatted_string(&Locale::en)
-        ));
-        ret.push_str(&format!(
-            "node link reserved bytes:     {:>15}\n",
-            self.bytes_written_link
-                .load(Acquire)
-                .to_formatted_string(&Locale::en)
-        ));
-        ret.push_str(&format!(
-            "other written reserved bytes: {:>15}\n",
-            self.bytes_written_other
-                .load(Acquire)
-                .to_formatted_string(&Locale::en)
-        ));
-
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
-        ret.push_str("segment accountant:\n");
-        ret.push_str(&p(vec![
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
+        println!("segment accountant:");
+        p(vec![
             lat("acquire", &self.accountant_lock),
             lat("hold", &self.accountant_hold),
             lat("next", &self.accountant_next),
-            lat("stabilize", &self.accountant_stabilize),
             lat("replace", &self.accountant_mark_replace),
             lat("link", &self.accountant_mark_link),
-        ]));
+        ]);
 
-        ret.push_str(&format!("{}\n", "-".repeat(134)));
-        ret.push_str("recovery:\n");
-        ret.push_str(&p(vec![
+        println!("{}", std::iter::repeat("-").take(134).collect::<String>());
+        println!("recovery:");
+        p(vec![
             lat("start", &self.tree_start),
             lat("advance snapshot", &self.advance_snapshot),
-            lat("fuzzy snapshot", &self.fuzzy_snapshot),
             lat("load SA", &self.start_segment_accountant),
             lat("load PC", &self.start_pagecache),
             lat("snap apply", &self.snapshot_apply),
@@ -409,8 +349,46 @@ impl Metrics {
             lat("log message read", &self.read_segment_message),
             sz("seg util start", &self.segment_utilization_startup),
             sz("seg util end", &self.segment_utilization_shutdown),
-        ]));
+        ]);
 
-        ret
+        #[cfg(feature = "measure_allocs")]
+        {
+            println!(
+                "{}",
+                std::iter::repeat("-").take(134).collect::<String>()
+            );
+            println!("allocation statistics:");
+            println!(
+                "total allocations: {}",
+                measure_allocs::ALLOCATIONS.load(Acquire)
+            );
+            println!(
+                "allocated bytes: {}",
+                measure_allocs::ALLOCATED_BYTES.load(Acquire)
+            );
+        }
     }
+}
+
+#[cfg(feature = "no_metrics")]
+impl Metrics {
+    pub const fn log_reservation_attempted(&self) {}
+
+    pub const fn log_reservation_success(&self) {}
+
+    pub const fn tree_child_split_attempt(&self) {}
+
+    pub const fn tree_child_split_success(&self) {}
+
+    pub const fn tree_parent_split_attempt(&self) {}
+
+    pub const fn tree_parent_split_success(&self) {}
+
+    pub const fn tree_root_split_attempt(&self) {}
+
+    pub const fn tree_root_split_success(&self) {}
+
+    pub const fn tree_looped(&self) {}
+
+    pub const fn print_profile(&self) {}
 }

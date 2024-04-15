@@ -1,8 +1,5 @@
 use std::ops::{Bound, Deref};
 
-#[cfg(feature = "metrics")]
-use crate::{Measure, M};
-
 use super::*;
 
 #[cfg(any(test, feature = "lock_free_delays"))]
@@ -111,7 +108,7 @@ impl Iter {
                 continue;
             } else if !node.contains_lower_bound(&self.lo, true) {
                 // node too high (maybe split, maybe exhausted?)
-                let seek_key = possible_predecessor(node.lo())?;
+                let seek_key = possible_predecessor(&node.lo)?;
                 let view = iter_try!(self.tree.view_for_key(seek_key, &guard));
                 pid = view.pid;
                 node = view.deref().clone();
@@ -133,11 +130,12 @@ impl Iter {
                     }
                     _ => return None,
                 }
-            } else if let Some(hi) = node.hi() {
-                self.lo = Bound::Included(hi.into());
-                continue;
             } else {
-                return None;
+                if node.hi.is_empty() {
+                    return None;
+                }
+                self.lo = Bound::Included(node.hi.clone());
+                continue;
             }
         }
         panic!(
@@ -151,7 +149,6 @@ impl Iterator for Iter {
     type Item = Result<(IVec, IVec)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.tree_scan);
         let _cc = concurrency_control::read();
         self.next_inner()
@@ -164,7 +161,6 @@ impl Iterator for Iter {
 
 impl DoubleEndedIterator for Iter {
     fn next_back(&mut self) -> Option<Self::Item> {
-        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.tree_reverse_scan);
         let guard = pin();
         let _cc = concurrency_control::read();
@@ -194,7 +190,7 @@ impl DoubleEndedIterator for Iter {
                 continue;
             } else if !node.contains_lower_bound(&self.hi, false) {
                 // node too high (maybe split, maybe exhausted?)
-                let seek_key = possible_predecessor(node.lo())?;
+                let seek_key = possible_predecessor(&node.lo)?;
                 let view = iter_try!(self.tree.view_for_key(seek_key, &guard));
                 pid = view.pid;
                 node = view.deref().clone();
@@ -216,10 +212,11 @@ impl DoubleEndedIterator for Iter {
                     }
                     _ => return None,
                 }
-            } else if node.lo().is_empty() {
-                return None;
             } else {
-                self.hi = Bound::Excluded(node.lo().into());
+                if node.lo.is_empty() {
+                    return None;
+                }
+                self.hi = Bound::Excluded(node.lo.clone());
                 continue;
             }
         }
@@ -231,7 +228,7 @@ impl DoubleEndedIterator for Iter {
 }
 
 #[test]
-fn basic_functionality() {
+fn test_possible_predecessor() {
     assert_eq!(possible_predecessor(b""), None);
     assert_eq!(possible_predecessor(&[0]), Some(vec![]));
     assert_eq!(possible_predecessor(&[0, 0]), Some(vec![0]));

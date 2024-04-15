@@ -14,7 +14,6 @@ use log::{debug, warn};
 
 use quickcheck::{QuickCheck, StdGen};
 
-use sled::Transactional;
 use sled::{transaction::*, *};
 
 use tree::{

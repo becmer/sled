@@ -58,8 +58,6 @@
 
 use std::{collections::BTreeSet, mem};
 
-use super::PageState;
-
 use crate::pagecache::*;
 use crate::*;
 

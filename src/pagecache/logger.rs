@@ -1,11 +1,11 @@
 use std::fs::File;
 
 use super::{
-    arr_to_lsn, arr_to_u32, assert_usize, header, iobuf, lsn_to_arr,
-    pread_exact, pread_exact_or_eof, roll_iobuf, u32_to_arr, Arc, BasedBuf,
-    DiskPtr, HeapId, IoBuf, IoBufs, LogKind, LogOffset, Lsn, MessageKind,
-    Reservation, Serialize, Snapshot, BATCH_MANIFEST_PID, COUNTER_PID,
-    MAX_MSG_HEADER_LEN, META_PID, SEG_HEADER_LEN,
+    arr_to_lsn, arr_to_u32, assert_usize, bump_atomic_lsn, header, iobuf,
+    lsn_to_arr, maybe_decompress, pread_exact, pread_exact_or_eof, read_blob,
+    roll_iobuf, u32_to_arr, BasedBuf, BlobPointer, IoBuf, IoBufs,
+    MessageKind, Reservation, Snapshot,
+    BATCH_MANIFEST_PID, COUNTER_PID, META_PID,
 };
 
 use crate::*;
@@ -55,22 +55,17 @@ impl Log {
                 / u64::try_from(self.config.segment_size).unwrap(),
         );
 
-        iobuf::make_durable(&self.iobufs, lsn)?;
-
         if ptr.is_inline() {
+            iobuf::make_durable(&self.iobufs, lsn)?;
             let f = &self.config.file;
-            read_message(
-                &**f,
-                ptr.lid().unwrap(),
-                expected_segment_number,
-                &self.config,
-            )
+            read_message(&**f, ptr.lid(), expected_segment_number, &self.config)
         } else {
             // we short-circuit the inline read
             // here because it might not still
             // exist in the inline log.
-            let heap_id = ptr.heap_id().unwrap();
-            self.config.heap.read(heap_id).map(|(kind, buf)| {
+            let (_, blob_ptr) = ptr.blob();
+            iobuf::make_durable(&self.iobufs, blob_ptr)?;
+            read_blob(blob_ptr, &self.config).map(|(kind, buf)| {
                 let header = MessageHeader {
                     kind,
                     pid,
@@ -78,7 +73,7 @@ impl Log {
                     crc32: 0,
                     len: 0,
                 };
-                LogRead::Heap(header, buf, heap_id, 0)
+                LogRead::Blob(header, buf, blob_ptr, 0)
             })
         }
     }
@@ -98,35 +93,29 @@ impl Log {
     }
 
     /// Reserve a replacement buffer for a previously written
-    /// heap write. This allows the tiny pointer in the log
-    /// to be migrated to a new segment without copying the
-    /// massive slab in the heap that the pointer references.
-    pub(super) fn rewrite_heap_pointer(
+    /// blob write. This ensures the message header has the
+    /// proper blob flag set.
+    pub(super) fn rewrite_blob_pointer(
         &self,
         pid: PageId,
-        heap_pointer: HeapId,
+        blob_pointer: BlobPointer,
         guard: &Guard,
     ) -> Result<Reservation<'_>> {
-        let ret = self.reserve_inner(
+        self.reserve_inner(
             LogKind::Replace,
             pid,
-            &heap_pointer,
-            Some(heap_pointer),
+            &blob_pointer,
+            Some(blob_pointer),
             guard,
-        );
-
-        if let Err(e) = &ret {
-            self.iobufs.set_global_error(*e);
-        }
-
-        ret
+        )
     }
 
     /// Tries to claim a reservation for writing a buffer to a
-    /// particular location in stable storage, which may either be
+    /// particular location in stable storge, which may either be
     /// completed or aborted later. Useful for maintaining
     /// linearizability across CAS operations that may need to
     /// persist part of their operation.
+    #[allow(unused)]
     pub fn reserve<T: Serialize + Debug>(
         &self,
         log_kind: LogKind,
@@ -134,13 +123,29 @@ impl Log {
         item: &T,
         guard: &Guard,
     ) -> Result<Reservation<'_>> {
-        let ret = self.reserve_inner(log_kind, pid, item, None, guard);
+        #[cfg(feature = "compression")]
+        {
+            if self.config.use_compression && pid != BATCH_MANIFEST_PID {
+                use zstd::block::compress;
 
-        if let Err(e) = &ret {
-            self.iobufs.set_global_error(*e);
+                let buf = item.serialize();
+
+                let _measure = Measure::new(&M.compress);
+
+                let compressed_buf =
+                    compress(&buf, self.config.compression_factor).unwrap();
+
+                return self.reserve_inner(
+                    log_kind,
+                    pid,
+                    &IVec::from(compressed_buf),
+                    None,
+                    guard,
+                );
+            }
         }
 
-        ret
+        self.reserve_inner(log_kind, pid, item, None, guard)
     }
 
     fn reserve_inner<T: Serialize + Debug>(
@@ -148,27 +153,25 @@ impl Log {
         log_kind: LogKind,
         pid: PageId,
         item: &T,
-        heap_rewrite: Option<HeapId>,
+        blob_rewrite: Option<Lsn>,
         _: &Guard,
     ) -> Result<Reservation<'_>> {
-        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.reserve_lat);
 
         let serialized_len = item.serialized_size();
         let max_buf_len =
             u64::try_from(MAX_MSG_HEADER_LEN).unwrap() + serialized_len;
 
-        #[cfg(feature = "metrics")]
         M.reserve_sz.measure(max_buf_len);
 
-        let max_buf_size = usize::try_from(super::heap::MIN_SZ * 15 / 16)
-            .unwrap()
-            .min(self.config.segment_size - SEG_HEADER_LEN);
+        let max_buf_size = (self.config.segment_size
+            / MINIMUM_ITEMS_PER_SEGMENT)
+            - SEG_HEADER_LEN;
 
-        let over_heap_threshold =
+        let over_blob_threshold =
             max_buf_len > u64::try_from(max_buf_size).unwrap();
 
-        assert!(!(over_heap_threshold && heap_rewrite.is_some()));
+        assert!(!(over_blob_threshold && blob_rewrite.is_some()));
 
         let mut printed = false;
         macro_rules! trace_once {
@@ -185,57 +188,27 @@ impl Log {
         let kind = match (
             pid,
             log_kind,
-            over_heap_threshold || heap_rewrite.is_some(),
+            over_blob_threshold || blob_rewrite.is_some(),
         ) {
             (COUNTER_PID, LogKind::Replace, false) => MessageKind::Counter,
-            (META_PID, LogKind::Replace, true) => MessageKind::HeapMeta,
+            (META_PID, LogKind::Replace, true) => MessageKind::BlobMeta,
             (META_PID, LogKind::Replace, false) => MessageKind::InlineMeta,
             (BATCH_MANIFEST_PID, LogKind::Skip, false) => {
                 MessageKind::BatchManifest
             }
             (_, LogKind::Free, false) => MessageKind::Free,
-            (_, LogKind::Replace, true) => MessageKind::HeapNode,
+            (_, LogKind::Replace, true) => MessageKind::BlobNode,
             (_, LogKind::Replace, false) => MessageKind::InlineNode,
-            (_, LogKind::Link, true) => MessageKind::HeapLink,
+            (_, LogKind::Link, true) => MessageKind::BlobLink,
             (_, LogKind::Link, false) => MessageKind::InlineLink,
             other => unreachable!(
                 "unexpected combination of PageId, \
-                 LogKind, and heap status: {:?}",
+                 LogKind, and blob status: {:?}",
                 other
             ),
         };
 
-        #[cfg(feature = "metrics")]
-        match kind {
-            MessageKind::HeapLink | MessageKind::HeapNode => {
-                M.bytes_written_heap_item.fetch_add(
-                    usize::try_from(serialized_len).unwrap(),
-                    Relaxed,
-                );
-                M.bytes_written_heap_ptr.fetch_add(16, Relaxed);
-            }
-            MessageKind::InlineNode => {
-                M.bytes_written_replace.fetch_add(
-                    usize::try_from(serialized_len).unwrap(),
-                    Relaxed,
-                );
-            }
-            MessageKind::InlineLink => {
-                M.bytes_written_link.fetch_add(
-                    usize::try_from(serialized_len).unwrap(),
-                    Relaxed,
-                );
-            }
-            _ => {
-                M.bytes_written_other.fetch_add(
-                    usize::try_from(serialized_len).unwrap(),
-                    Relaxed,
-                );
-            }
-        }
-
         loop {
-            #[cfg(feature = "metrics")]
             M.log_reservation_attempted();
 
             // don't continue if the system
@@ -264,7 +237,7 @@ impl Log {
                 // has already been bumped by sealer.
                 trace_once!("io buffer already sealed, spinning");
 
-                backoff.spin();
+                backoff.snooze();
 
                 continue;
             }
@@ -280,18 +253,17 @@ impl Log {
                         / u64::try_from(self.config.segment_size).unwrap(),
                 ),
                 pid,
-                len: if over_heap_threshold {
-                    // a HeapId is always 16 bytes
-                    16
+                len: if over_blob_threshold {
+                    reservation_lsn.serialized_size()
                 } else {
                     serialized_len
                 },
             };
 
-            let inline_buf_len = if over_heap_threshold {
+            let inline_buf_len = if over_blob_threshold {
                 usize::try_from(
-                    // a HeapId is always 16 bytes
-                    message_header.serialized_size() + 16,
+                    message_header.serialized_size()
+                        + reservation_lsn.serialized_size(),
                 )
                 .unwrap()
             } else {
@@ -301,12 +273,7 @@ impl Log {
                 .unwrap()
             };
 
-            trace!(
-                "reserving buf of len {} for pid {} with kind {:?}",
-                inline_buf_len,
-                pid,
-                kind
-            );
+            trace!("reserving buf of len {}", inline_buf_len);
 
             // try to claim space
             let prospective_size = buf_offset + inline_buf_len;
@@ -315,7 +282,7 @@ impl Log {
             // recovery, we assume that nothing can begin here,
             // because headers are dynamically sized.
             let red_zone = iobuf.capacity - buf_offset < MAX_MSG_HEADER_LEN;
-            let would_overflow = red_zone || prospective_size > iobuf.capacity;
+            let would_overflow = prospective_size > iobuf.capacity || red_zone;
             if would_overflow {
                 // This buffer is too full to accept our write!
                 // Try to seal the buffer, and maybe write it if
@@ -340,7 +307,7 @@ impl Log {
                     "spinning because our buffer has {} writers already",
                     header::MAX_WRITERS
                 );
-                backoff.spin();
+                backoff.snooze();
                 continue;
             }
 
@@ -385,35 +352,27 @@ impl Log {
                 reservation_lid,
             );
 
-            self.iobufs
-                .max_reserved_lsn
-                .fetch_max(reservation_lsn + inline_buf_len as Lsn - 1, SeqCst);
+            bump_atomic_lsn(
+                &self.iobufs.max_reserved_lsn,
+                reservation_lsn + inline_buf_len as Lsn - 1,
+            );
 
-            let (heap_reservation, heap_id_opt) = if over_heap_threshold {
-                let heap_reservation = self
-                    .config
-                    .heap
-                    .reserve(serialized_len + 13, reservation_lsn);
-                let heap_id = heap_reservation.heap_id;
-                (Some(heap_reservation), Some(heap_id))
-            } else {
-                (None, None)
-            };
+            let blob_id =
+                if over_blob_threshold { Some(reservation_lsn) } else { None };
 
             self.iobufs.encapsulate(
                 item,
                 message_header,
                 destination,
-                heap_reservation,
+                blob_id,
             )?;
 
-            #[cfg(feature = "metrics")]
             M.log_reservation_success();
 
-            let pointer = if let Some(heap_id) = heap_id_opt {
-                DiskPtr::new_heap_item(reservation_lid, heap_id)
-            } else if let Some(heap_id) = heap_rewrite {
-                DiskPtr::new_heap_item(reservation_lid, heap_id)
+            let pointer = if let Some(blob_id) = blob_id {
+                DiskPtr::new_blob(reservation_lid, blob_id)
+            } else if let Some(blob_rewrite) = blob_rewrite {
+                DiskPtr::new_blob(reservation_lid, blob_rewrite)
             } else {
                 DiskPtr::new_inline(reservation_lid)
             };
@@ -425,7 +384,7 @@ impl Log {
                 flushed: false,
                 lsn: reservation_lsn,
                 pointer,
-                is_heap_item_rewrite: heap_rewrite.is_some(),
+                is_blob_rewrite: blob_rewrite.is_some(),
                 header_len: usize::try_from(message_header.serialized_size())
                     .unwrap(),
             });
@@ -441,13 +400,15 @@ impl Log {
         // Decrement writer count, retrying until successful.
         loop {
             let new_hv = header::decr_writers(header);
-            if let Err(current) = iobuf.cas_header(header, new_hv) {
-                // we failed to decr, retry
-                header = current;
-            } else {
-                // success
-                header = new_hv;
-                break;
+            match iobuf.cas_header(header, new_hv) {
+                Ok(new) => {
+                    header = new;
+                    break;
+                }
+                Err(new) => {
+                    // we failed to decr, retry
+                    header = new;
+                }
             }
         }
 
@@ -471,9 +432,17 @@ impl Log {
                  to log from exit_reservation",
                 lsn
             );
-            let iobufs2 = self.iobufs.clone();
-            let iobuf2 = iobuf.clone();
-            threadpool::write_to_log(iobuf2, iobufs2);
+            let iobufs = self.iobufs.clone();
+            let iobuf = iobuf.clone();
+            threadpool::spawn(move || {
+                if let Err(e) = iobufs.write_to_log(&iobuf) {
+                    error!(
+                        "hit error while writing iobuf with lsn {}: {:?}",
+                        lsn, e
+                    );
+                    iobufs.config.set_global_error(e);
+                }
+            })?;
 
             Ok(())
         } else {
@@ -502,7 +471,7 @@ impl Drop for Log {
 }
 
 /// All log messages are prepended with this header
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct MessageHeader {
     pub crc32: u32,
     pub kind: MessageKind,
@@ -512,7 +481,7 @@ pub struct MessageHeader {
 }
 
 /// A number representing a segment number.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(transparent)]
 pub struct SegmentNumber(pub u64);
 
@@ -526,7 +495,7 @@ impl std::ops::Deref for SegmentNumber {
 
 /// A segment's header contains the new base LSN and a reference
 /// to the previous log segment.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct SegmentHeader {
     pub lsn: Lsn,
     pub max_stable_lsn: Lsn,
@@ -538,30 +507,33 @@ pub struct SegmentHeader {
 pub enum LogRead {
     /// Successful read, entirely on-log
     Inline(MessageHeader, Vec<u8>, u32),
-    /// Successful read, spilled to a slot in the heap
-    Heap(MessageHeader, Vec<u8>, HeapId, u32),
+    /// Successful read, spilled to its own blob file
+    Blob(MessageHeader, Vec<u8>, BlobPointer, u32),
     /// A cancelled message was encountered
     Canceled(u32),
     /// A padding message used to show that a segment was filled
     Cap(SegmentNumber),
     /// This log message was not readable due to corruption
     Corrupted,
-    /// This heap slot has been replaced
-    DanglingHeap(MessageHeader, HeapId, u32),
+    /// This blob file is no longer available
+    DanglingBlob(MessageHeader, BlobPointer, u32),
     /// This data may only be read if at least this future location is stable
     BatchManifest(Lsn, u32),
 }
 
 impl LogRead {
-    /// Return true if we read a successful Inline or Heap value.
-    pub const fn is_successful(&self) -> bool {
-        matches!(self, LogRead::Inline(..) | LogRead::Heap(..))
+    /// Return true if we read a successful Inline or Blob value.
+    pub fn is_successful(&self) -> bool {
+        match *self {
+            LogRead::Inline(..) | LogRead::Blob(..) => true,
+            _ => false,
+        }
     }
 
     /// Return the underlying data read from a log read, if successful.
     pub fn into_data(self) -> Option<Vec<u8>> {
         match self {
-            LogRead::Heap(_, buf, _, _) | LogRead::Inline(_, buf, _) => {
+            LogRead::Blob(_, buf, _, _) | LogRead::Inline(_, buf, _) => {
                 Some(buf)
             }
             _ => None,
@@ -599,14 +571,14 @@ impl From<[u8; SEG_HEADER_LEN]> for SegmentHeader {
     }
 }
 
-impl From<SegmentHeader> for [u8; SEG_HEADER_LEN] {
-    fn from(header: SegmentHeader) -> [u8; SEG_HEADER_LEN] {
+impl Into<[u8; SEG_HEADER_LEN]> for SegmentHeader {
+    fn into(self) -> [u8; SEG_HEADER_LEN] {
         let mut buf = [0; SEG_HEADER_LEN];
 
-        let xor_lsn = header.lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
+        let xor_lsn = self.lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
         let lsn_arr = lsn_to_arr(xor_lsn);
 
-        let xor_max_stable_lsn = header.max_stable_lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
+        let xor_max_stable_lsn = self.max_stable_lsn ^ 0x7FFF_FFFF_FFFF_FFFF;
         let highest_stable_lsn_arr = lsn_to_arr(xor_max_stable_lsn);
 
         #[allow(unsafe_code)]
@@ -660,23 +632,31 @@ pub(crate) fn read_segment_header(
 }
 
 pub(crate) trait ReadAt {
-    fn pread_exact(&self, dst: &mut [u8], at: u64) -> Result<()>;
+    fn pread_exact(&self, dst: &mut [u8], at: u64) -> std::io::Result<()>;
 
-    fn pread_exact_or_eof(&self, dst: &mut [u8], at: u64) -> Result<usize>;
+    fn pread_exact_or_eof(
+        &self,
+        dst: &mut [u8],
+        at: u64,
+    ) -> std::io::Result<usize>;
 }
 
 impl ReadAt for File {
-    fn pread_exact(&self, dst: &mut [u8], at: u64) -> Result<()> {
+    fn pread_exact(&self, dst: &mut [u8], at: u64) -> std::io::Result<()> {
         pread_exact(self, dst, at)
     }
 
-    fn pread_exact_or_eof(&self, dst: &mut [u8], at: u64) -> Result<usize> {
+    fn pread_exact_or_eof(
+        &self,
+        dst: &mut [u8],
+        at: u64,
+    ) -> std::io::Result<usize> {
         pread_exact_or_eof(self, dst, at)
     }
 }
 
 impl ReadAt for BasedBuf {
-    fn pread_exact(&self, dst: &mut [u8], mut at: u64) -> Result<()> {
+    fn pread_exact(&self, dst: &mut [u8], mut at: u64) -> std::io::Result<()> {
         if at < self.offset
             || u64::try_from(dst.len()).unwrap() + at
                 > u64::try_from(self.buf.len()).unwrap() + self.offset
@@ -684,8 +664,7 @@ impl ReadAt for BasedBuf {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "failed to fill buffer",
-            )
-            .into());
+            ));
         }
         at -= self.offset;
         let at_usize = usize::try_from(at).unwrap();
@@ -694,15 +673,18 @@ impl ReadAt for BasedBuf {
         Ok(())
     }
 
-    fn pread_exact_or_eof(&self, dst: &mut [u8], mut at: u64) -> Result<usize> {
+    fn pread_exact_or_eof(
+        &self,
+        dst: &mut [u8],
+        mut at: u64,
+    ) -> std::io::Result<usize> {
         if at < self.offset
             || u64::try_from(self.buf.len()).unwrap() < at - self.offset
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "failed to fill buffer",
-            )
-            .into());
+            ));
         }
         at -= self.offset;
 
@@ -722,9 +704,8 @@ pub(crate) fn read_message<R: ReadAt>(
     file: &R,
     lid: LogOffset,
     expected_segment_number: SegmentNumber,
-    config: &RunningConfig,
+    config: &Config,
 ) -> Result<LogRead> {
-    #[cfg(feature = "metrics")]
     let _measure = Measure::new(&M.read);
     let segment_len = config.segment_size;
     let seg_start = lid / segment_len as LogOffset * segment_len as LogOffset;
@@ -742,13 +723,8 @@ pub(crate) fn read_message<R: ReadAt>(
     let len_before = header_cursor.len();
     let header = MessageHeader::deserialize(header_cursor)?;
     let len_after = header_cursor.len();
+    trace!("read message header at lid {}: {:?}", lid, header);
     let message_offset = len_before - len_after;
-    trace!(
-        "read message header at lid {} with header length {}: {:?}",
-        lid,
-        message_offset,
-        header
-    );
 
     let ceiling = seg_start + segment_len as LogOffset;
 
@@ -792,13 +768,7 @@ pub(crate) fn read_message<R: ReadAt>(
     );
 
     if crc32 != header.crc32 {
-        trace!(
-            "read a message with a bad checksum with header {:?} msg len: {} expected: {} actual: {}",
-            header,
-            header_len,
-            header.crc32,
-            crc32
-        );
+        trace!("read a message with a bad checksum with header {:?}", header);
         return Ok(LogRead::Corrupted);
     }
 
@@ -822,26 +792,34 @@ pub(crate) fn read_message<R: ReadAt>(
             trace!("read pad in segment number {:?}", header.segment_number);
             Ok(LogRead::Cap(header.segment_number))
         }
-        MessageKind::HeapLink
-        | MessageKind::HeapNode
-        | MessageKind::HeapMeta => {
-            assert_eq!(buf.len(), 16);
-            let heap_id = HeapId::deserialize(&mut &buf[..]).unwrap();
+        MessageKind::BlobLink
+        | MessageKind::BlobNode
+        | MessageKind::BlobMeta => {
+            let id = arr_to_lsn(&buf);
 
-            match config.heap.read(heap_id) {
-                Ok((kind, buf2)) => {
+            match read_blob(id, config) {
+                Ok((kind, buf)) => {
                     assert_eq!(header.kind, kind);
                     trace!(
-                        "read a successful heap message for heap {:?} in segment number {:?}",
-                        heap_id,
+                        "read a successful blob message for blob {} in segment number {:?}",
+                        id,
                         header.segment_number,
                     );
 
-                    Ok(LogRead::Heap(header, buf2, heap_id, inline_len))
+                    Ok(LogRead::Blob(header, buf, id, inline_len))
                 }
-                Err(e) => {
-                    debug!("failed to read heap: {:?}", e);
-                    Ok(LogRead::DanglingHeap(header, heap_id, inline_len))
+                Err(Error::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    debug!(
+                        "underlying blob file not found for blob {} in segment number {:?}",
+                        id, header.segment_number,
+                    );
+                    Ok(LogRead::DanglingBlob(header, id, inline_len))
+                }
+                Err(other_e) => {
+                    debug!("failed to read blob: {:?}", other_e);
+                    Err(other_e)
                 }
             }
         }
@@ -851,6 +829,12 @@ pub(crate) fn read_message<R: ReadAt>(
         | MessageKind::Free
         | MessageKind::Counter => {
             trace!("read a successful inline message");
+            let buf = if config.use_compression {
+                maybe_decompress(buf)?
+            } else {
+                buf
+            };
+
             Ok(LogRead::Inline(header, buf, inline_len))
         }
         MessageKind::BatchManifest => {

@@ -1,14 +1,14 @@
 use std::{
+    collections::HashMap,
     fs,
     fs::File,
     io,
-    io::{BufRead, BufReader, ErrorKind, Read, Seek, Write},
+    io::{BufRead, BufReader, ErrorKind, Seek},
     ops::Deref,
     path::{Path, PathBuf},
-    sync::atomic::AtomicUsize,
 };
 
-use crate::pagecache::{arr_to_u32, u32_to_arr, Heap};
+use crate::pagecache::{arr_to_u32, u32_to_arr};
 use crate::*;
 
 const DEFAULT_PATH: &str = "default.sled";
@@ -55,7 +55,7 @@ impl StorageParameters {
     pub fn deserialize(bytes: &[u8]) -> Result<StorageParameters> {
         let reader = BufReader::new(bytes);
 
-        let mut lines = Map::new();
+        let mut lines = HashMap::new();
 
         for line in reader.lines() {
             let line = if let Ok(l) = line {
@@ -68,7 +68,8 @@ impl StorageParameters {
                 return Err(Error::Unsupported(
                     "failed to open database that may \
                      have been created using a sled version \
-                     earlier than 0.29",
+                     earlier than 0.29"
+                        .to_string(),
                 ));
             };
             let mut split = line.split(": ").map(String::from);
@@ -186,7 +187,7 @@ impl Deref for Config {
 #[derive(Debug, Clone)]
 pub struct Inner {
     #[doc(hidden)]
-    pub cache_capacity: usize,
+    pub cache_capacity: u64,
     #[doc(hidden)]
     pub flush_every_ms: Option<u64>,
     #[doc(hidden)]
@@ -204,9 +205,9 @@ pub struct Inner {
     #[doc(hidden)]
     pub compression_factor: i32,
     #[doc(hidden)]
-    pub idgen_persist_interval: u64,
+    pub print_profile_on_drop: bool,
     #[doc(hidden)]
-    pub snapshot_after_ops: u64,
+    pub idgen_persist_interval: u64,
     #[doc(hidden)]
     pub version: (usize, usize),
     tmp_path: PathBuf,
@@ -232,16 +233,12 @@ impl Default for Inner {
 
             // useful in testing
             segment_size: 512 * 1024, // 512kb in bytes
+            print_profile_on_drop: false,
             flush_every_ms: Some(500),
             idgen_persist_interval: 1_000_000,
-            snapshot_after_ops: if cfg!(feature = "for-internal-testing-only") {
-                10
-            } else {
-                1_000_000
-            },
             global_error: Arc::new(Atomic::default()),
             #[cfg(feature = "event_log")]
-            event_log: Arc::new(crate::event_log::EventLog::default()),
+            event_log: Arc::new(event_log::EventLog::default()),
         }
     }
 }
@@ -255,6 +252,10 @@ impl Inner {
         } else {
             self.path.clone()
         }
+    }
+
+    pub(crate) fn blob_path(&self, id: Lsn) -> PathBuf {
+        self.get_path().join("blobs").join(format!("{}", id))
     }
 
     fn db_path(&self) -> PathBuf {
@@ -271,7 +272,7 @@ impl Inner {
             + TryFrom<usize>
             + std::ops::Div<Output = T>
             + std::ops::Mul<Output = T>,
-        <T as std::convert::TryFrom<usize>>::Error: Debug,
+        <T as TryFrom<usize>>::Error: Debug,
     {
         let segment_size: T = T::try_from(self.segment_size).unwrap();
         value / segment_size * segment_size
@@ -281,7 +282,7 @@ impl Inner {
 macro_rules! supported {
     ($cond:expr, $msg:expr) => {
         if !$cond {
-            return Err(Error::Unsupported($msg));
+            return Err(Error::Unsupported($msg.to_owned()));
         }
     };
 }
@@ -346,18 +347,46 @@ impl Config {
 
         let file = config.open_file()?;
 
-        let heap_path = config.get_path().join("heap");
-        let heap = Heap::start(&heap_path)?;
-        maybe_fsync_directory(heap_path)?;
-
         // seal config in a Config
-        let config = RunningConfig {
-            inner: config,
-            file: Arc::new(file),
-            heap: Arc::new(heap),
-        };
+        let config = RunningConfig { inner: config, file: Arc::new(file) };
 
         Db::start_inner(config)
+    }
+
+    #[doc(hidden)]
+    #[deprecated(
+        since = "0.31.0",
+        note = "this does nothing for now. maybe it will come back in the future."
+    )]
+    pub const fn segment_cleanup_skew(self, _: usize) -> Self {
+        self
+    }
+
+    #[doc(hidden)]
+    #[deprecated(
+        since = "0.31.0",
+        note = "this does nothing for now. maybe it will come back in the future."
+    )]
+    pub const fn segment_cleanup_threshold(self, _: u8) -> Self {
+        self
+    }
+
+    #[doc(hidden)]
+    #[deprecated(
+        since = "0.31.0",
+        note = "this does nothing for now. maybe it will come back in the future."
+    )]
+    pub const fn snapshot_after_ops(self, _: u64) -> Self {
+        self
+    }
+
+    #[doc(hidden)]
+    #[deprecated(
+        since = "0.31.0",
+        note = "this does nothing for now. maybe it will come back in the future."
+    )]
+    pub fn snapshot_path<P>(self, _: P) -> Self {
+        self
     }
 
     #[doc(hidden)]
@@ -386,6 +415,30 @@ impl Config {
         let m = Arc::make_mut(&mut self.0);
         m.idgen_persist_interval = interval;
         self
+    }
+
+    /// Finalize the configuration.
+    ///
+    /// # Panics
+    ///
+    /// This function will panic if it is not possible
+    /// to open the files for performing database IO,
+    /// or if the provided configuration fails some
+    /// basic sanity checks.
+    #[doc(hidden)]
+    #[deprecated(since = "0.29.0", note = "use Config::open instead")]
+    pub fn build(mut self) -> RunningConfig {
+        // only validate, setup directory, and open file once
+        self.validate().unwrap();
+
+        self.limit_cache_max_memory();
+
+        let file = self.open_file().unwrap_or_else(|e| {
+            panic!("open file at {:?}: {}", self.db_path(), e);
+        });
+
+        // seal config in a Config
+        RunningConfig { inner: self, file: Arc::new(file) }
     }
 
     fn gen_temp_path() -> PathBuf {
@@ -418,23 +471,22 @@ impl Config {
     }
 
     fn limit_cache_max_memory(&mut self) {
-        if let Some(limit) = sys_limits::get_memory_limit() {
-            if self.cache_capacity > limit {
-                let m = Arc::make_mut(&mut self.0);
-                m.cache_capacity = limit;
-                error!(
-                    "cache capacity is limited to the cgroup memory \
+        let limit = sys_limits::get_memory_limit();
+        if limit > 0 && self.cache_capacity > limit {
+            let m = Arc::make_mut(&mut self.0);
+            m.cache_capacity = limit;
+            error!(
+                "cache capacity is limited to the cgroup memory \
                  limit: {} bytes",
-                    self.cache_capacity
-                );
-            }
+                self.cache_capacity
+            );
         }
     }
 
     builder!(
         (
             cache_capacity,
-            usize,
+            u64,
             "maximum size in bytes for the system page cache"
         ),
         (
@@ -459,9 +511,9 @@ impl Config {
             "attempts to exclusively open the database, failing if it already exists"
         ),
         (
-            snapshot_after_ops,
-            u64,
-            "take a fuzzy snapshot of pagecache metadata after this many ops"
+            print_profile_on_drop,
+            bool,
+            "print a performance profile when the Config is dropped"
         )
     );
 
@@ -481,8 +533,8 @@ impl Config {
         );
         if self.use_compression {
             supported!(
-                !cfg!(feature = "no_zstd"),
-                "the 'no_zstd' feature is set, but Config.use_compression is also set to true"
+                cfg!(feature = "compression"),
+                "the 'compression' feature must be enabled"
             );
         }
         supported!(
@@ -501,10 +553,10 @@ impl Config {
     }
 
     fn open_file(&self) -> Result<File> {
-        let heap_dir: PathBuf = self.get_path().join("heap");
+        let blob_dir: PathBuf = self.get_path().join("blobs");
 
-        if !heap_dir.exists() {
-            fs::create_dir_all(heap_dir)?;
+        if !blob_dir.exists() {
+            fs::create_dir_all(blob_dir)?;
         }
 
         self.verify_config()?;
@@ -520,13 +572,7 @@ impl Config {
             options.create_new(true);
         }
 
-        let _ = std::fs::File::create(
-            self.get_path().join("DO_NOT_USE_THIS_DIRECTORY_FOR_ANYTHING"),
-        );
-
-        let file = self.try_lock(options.open(&self.db_path())?)?;
-        maybe_fsync_directory(self.get_path())?;
-        Ok(file)
+        self.try_lock(options.open(&self.db_path())?)
     }
 
     fn try_lock(&self, file: File) -> Result<File> {
@@ -537,23 +583,26 @@ impl Config {
         {
             use fs2::FileExt;
 
-            let try_lock =
-                if cfg!(any(feature = "for-internal-testing-only", feature = "light_testing")) {
-                    // we block here because during testing
-                    // there are many filesystem race condition
-                    // that happen, causing locks to be held
-                    // for long periods of time, so we should
-                    // block to wait on reopening files.
-                    file.lock_exclusive()
-                } else {
-                    file.try_lock_exclusive()
-                };
+            let try_lock = if cfg!(feature = "testing") {
+                // we block here because during testing
+                // there are many filesystem race condition
+                // that happen, causing locks to be held
+                // for long periods of time, so we should
+                // block to wait on reopening files.
+                file.lock_exclusive()
+            } else {
+                file.try_lock_exclusive()
+            };
 
-            if try_lock.is_err() {
-                return Err(Error::Io(
+            if let Err(e) = try_lock {
+                return Err(Error::Io(io::Error::new(
                     ErrorKind::Other,
-                    "could not acquire database file lock",
-                ));
+                    format!(
+                        "could not acquire lock on {:?}: {:?}",
+                        self.db_path().to_string_lossy(),
+                        e
+                    ),
+                )));
             }
         }
 
@@ -563,27 +612,28 @@ impl Config {
     fn verify_config(&self) -> Result<()> {
         match self.read_config() {
             Ok(Some(old)) => {
-                if self.use_compression {
-                    supported!(
-                        old.use_compression,
-                        "cannot change compression configuration across restarts. \
-                        this database was created without compression enabled."
-                    );
-                } else {
-                    supported!(
-                        !old.use_compression,
-                        "cannot change compression configuration across restarts. \
-                        this database was created with compression enabled."
-                    );
-                }
+                supported!(
+                    self.use_compression == old.use_compression,
+                    format!(
+                        "cannot change compression values across restarts. \
+                         old value of use_compression loaded from disk: {}, \
+                         currently set value: {}.",
+                        old.use_compression, self.use_compression,
+                    )
+                );
 
                 supported!(
                     self.segment_size == old.segment_size,
-                    "cannot change the io buffer size across restarts."
+                    format!(
+                        "cannot change the io buffer size across restarts. \
+                         please change it back to {}",
+                        old.segment_size
+                    )
                 );
 
-                if self.version != old.version {
-                    error!(
+                supported!(
+                    self.version == old.version,
+                    format!(
                         "This database was created using \
                          pagecache version {}.{}, but our pagecache \
                          version is {}.{}. Please perform an upgrade \
@@ -593,13 +643,8 @@ impl Config {
                         old.version.1,
                         self.version.0,
                         self.version.1,
-                    );
-                    supported!(
-                        self.version == old.version,
-                        "The stored database must use a compatible sled version.
-                        See error log for more details."
-                    );
-                }
+                    )
+                );
                 Ok(())
             }
             Ok(None) => self.write_config(),
@@ -622,22 +667,15 @@ impl Config {
         let crc: u32 = crc32(&*bytes);
         let crc_arr = u32_to_arr(crc);
 
-        let temp_path = self.get_path().join("conf.tmp");
-        let final_path = self.config_path();
+        let path = self.config_path();
 
         let mut f =
-            fs::OpenOptions::new().write(true).create(true).open(&temp_path)?;
+            fs::OpenOptions::new().write(true).create(true).open(path)?;
 
         io_fail!(self, "write_config bytes");
         f.write_all(&*bytes)?;
         io_fail!(self, "write_config crc");
         f.write_all(&crc_arr)?;
-        io_fail!(self, "write_config fsync");
-        f.sync_all()?;
-        io_fail!(self, "write_config rename");
-        fs::rename(temp_path, final_path)?;
-        io_fail!(self, "write_config dir fsync");
-        maybe_fsync_directory(self.get_path())?;
         io_fail!(self, "write_config post");
         Ok(())
     }
@@ -696,7 +734,7 @@ impl Config {
         } else {
             #[allow(unsafe_code)]
             unsafe {
-                Err(*ge.deref())
+                Err(ge.deref().clone())
             }
         }
     }
@@ -705,6 +743,7 @@ impl Config {
         let guard = pin();
         let old = self.global_error.swap(Shared::default(), SeqCst, &guard);
         if !old.is_null() {
+            let guard = pin();
             #[allow(unsafe_code)]
             unsafe {
                 guard.defer_destroy(old);
@@ -718,9 +757,10 @@ impl Config {
 
         let expected_old = Shared::null();
 
-        let _ = self.global_error.compare_and_set(
+        let _ = self.global_error.compare_exchange(
             expected_old,
             error,
+            SeqCst,
             SeqCst,
             &guard,
         );
@@ -733,7 +773,7 @@ impl Config {
     pub fn truncate_corrupt(&self, new_len: u64) {
         self.event_log.reset();
         let path = self.db_path();
-        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
         f.set_len(new_len).expect("should be able to truncate");
     }
 }
@@ -745,8 +785,13 @@ impl Config {
 pub struct RunningConfig {
     inner: Config,
     pub(crate) file: Arc<File>,
-    pub(crate) heap: Arc<Heap>,
 }
+
+#[allow(unsafe_code)]
+unsafe impl Send for RunningConfig {}
+
+#[allow(unsafe_code)]
+unsafe impl Sync for RunningConfig {}
 
 impl Deref for RunningConfig {
     type Target = Config;
@@ -756,23 +801,19 @@ impl Deref for RunningConfig {
     }
 }
 
-#[cfg(all(not(miri), any(windows, target_os = "linux", target_os = "macos")))]
-impl Drop for RunningConfig {
-    fn drop(&mut self) {
-        use fs2::FileExt;
-        if Arc::strong_count(&self.file) == 1 {
-            let _ = self.file.unlock();
-        }
-    }
-}
-
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.temporary {
-            // Our files are temporary, so nuke them.
-            debug!("removing temporary storage file {:?}", self.get_path());
-            let _res = fs::remove_dir_all(&self.get_path());
+        if self.print_profile_on_drop {
+            M.print_profile();
         }
+
+        if !self.temporary {
+            return;
+        }
+
+        // Our files are temporary, so nuke them.
+        debug!("removing temporary storage file {:?}", self.get_path());
+        let _res = fs::remove_dir_all(&self.get_path());
     }
 }
 
@@ -780,12 +821,12 @@ impl RunningConfig {
     // returns the snapshot file paths for this system
     #[doc(hidden)]
     pub fn get_snapshot_files(&self) -> io::Result<Vec<PathBuf>> {
-        let conf_path = self.get_path().join("snap.");
+        let path = self.get_path().join("snap.");
 
-        let absolute_path: PathBuf = if Path::new(&conf_path).is_absolute() {
-            conf_path
+        let absolute_path: PathBuf = if Path::new(&path).is_absolute() {
+            path
         } else {
-            std::env::current_dir()?.join(conf_path)
+            std::env::current_dir()?.join(path)
         };
 
         let filter = |dir_entry: io::Result<fs::DirEntry>| {
@@ -794,7 +835,7 @@ impl RunningConfig {
                 let path = path_buf.as_path();
                 let path_str = &*path.to_string_lossy();
                 if path_str.starts_with(&*absolute_path.to_string_lossy())
-                    && !path_str.ends_with(".generating")
+                    && !path_str.ends_with(".in___motion")
                 {
                     Some(path.to_path_buf())
                 } else {

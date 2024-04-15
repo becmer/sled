@@ -1,8 +1,11 @@
+#[cfg(feature = "zstd")]
+use zstd::block::{compress, decompress};
+
 use crate::*;
 
 use super::{
-    arr_to_u32, pwrite_all, raw_segment_iter_from, u32_to_arr, u64_to_arr,
-    BasedBuf, DiskPtr, HeapId, LogIter, LogKind, LogOffset, Lsn, MessageKind,
+    arr_to_u32, gc_blobs, pwrite_all, raw_segment_iter_from, u32_to_arr,
+    u64_to_arr, BasedBuf, LogIter, MessageKind,
 };
 
 /// A snapshot of the state required to quickly restart
@@ -10,8 +13,6 @@ use super::{
 #[derive(PartialEq, Debug, Default)]
 #[cfg_attr(test, derive(Clone))]
 pub struct Snapshot {
-    /// The version of the snapshot format
-    pub version: u8,
     /// The last read message lsn
     pub stable_lsn: Option<Lsn>,
     /// The last read message lid
@@ -20,7 +21,7 @@ pub struct Snapshot {
     pub pt: Vec<PageState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PageState {
     /// Present signifies a page that has some data.
     ///
@@ -30,7 +31,7 @@ pub enum PageState {
     /// correct by construction.
     /// The third element in each tuple is the on-log
     /// size for the corresponding write. If things
-    /// are pretty large, they spill into the heaps
+    /// are pretty large, they spill into the blobs
     /// directory, but still get a small pointer that
     /// gets written into the log. The sizes are used
     /// for the garbage collection statistics on
@@ -39,8 +40,8 @@ pub enum PageState {
     /// and the size tells us how much storage it uses
     /// on the disk.
     Present {
-        base: (Lsn, DiskPtr),
-        frags: Vec<(Lsn, DiskPtr)>,
+        base: (Lsn, DiskPtr, u64),
+        frags: Vec<(Lsn, DiskPtr, u64)>,
     },
 
     /// This is a free page.
@@ -49,7 +50,7 @@ pub enum PageState {
 }
 
 impl PageState {
-    fn push(&mut self, item: (Lsn, DiskPtr)) {
+    fn push(&mut self, item: (Lsn, DiskPtr, u64)) {
         match *self {
             PageState::Present { base, ref mut frags } => {
                 if frags.last().map_or(base.0, |f| f.0) < item.0 {
@@ -66,16 +67,19 @@ impl PageState {
         }
     }
 
-    pub(crate) const fn is_free(&self) -> bool {
-        matches!(self, PageState::Free(_, _))
+    pub(crate) fn is_free(&self) -> bool {
+        match *self {
+            PageState::Free(_, _) => true,
+            _ => false,
+        }
     }
 
     #[cfg(feature = "testing")]
-    fn offsets(&self) -> Vec<Option<LogOffset>> {
+    fn offsets(&self) -> Vec<LogOffset> {
         match *self {
             PageState::Present { base, ref frags } => {
                 let mut offsets = vec![base.1.lid()];
-                for (_, ptr) in frags {
+                for (_, ptr, _) in frags {
                     offsets.push(ptr.lid());
                 }
                 offsets
@@ -85,33 +89,6 @@ impl PageState {
                 panic!("called offsets on Uninitialized")
             }
         }
-    }
-
-    pub(crate) fn heap_ids(&self) -> Vec<HeapId> {
-        let mut ret = vec![];
-
-        match *self {
-            PageState::Present { base, ref frags } => {
-                if let Some(heap_id) = base.1.heap_id() {
-                    ret.push(heap_id);
-                }
-                for (_, ptr) in frags {
-                    if let Some(heap_id) = ptr.heap_id() {
-                        ret.push(heap_id);
-                    }
-                }
-            }
-            PageState::Free(_, ptr) => {
-                if let Some(heap_id) = ptr.heap_id() {
-                    ret.push(heap_id);
-                }
-            }
-            PageState::Uninitialized => {
-                panic!("called heap_ids on Uninitialized")
-            }
-        }
-
-        ret
     }
 }
 
@@ -145,6 +122,7 @@ impl Snapshot {
         pid: PageId,
         lsn: Lsn,
         disk_ptr: DiskPtr,
+        sz: u64,
     ) -> Result<()> {
         trace!(
             "trying to deserialize buf for pid {} ptr {} lsn {}",
@@ -152,7 +130,6 @@ impl Snapshot {
             disk_ptr,
             lsn
         );
-        #[cfg(feature = "metrics")]
         let _measure = Measure::new(&M.snapshot_apply);
 
         let pushed = if self.pt.len() <= usize::try_from(pid).unwrap() {
@@ -176,8 +153,10 @@ impl Snapshot {
 
                 let pid_usize = usize::try_from(pid).unwrap();
 
-                self.pt[pid_usize] =
-                    PageState::Present { base: (lsn, disk_ptr), frags: vec![] };
+                self.pt[pid_usize] = PageState::Present {
+                    base: (lsn, disk_ptr, sz),
+                    frags: vec![],
+                };
             }
             LogKind::Link => {
                 // Because we rewrite pages over time, we may have relocated
@@ -193,7 +172,7 @@ impl Snapshot {
                         lsn,
                     );
 
-                    lids.push((lsn, disk_ptr));
+                    lids.push((lsn, disk_ptr, sz));
                 } else {
                     trace!(
                         "skipping dangling append of pid {} at lid {} lsn {}",
@@ -204,9 +183,7 @@ impl Snapshot {
                     if pushed {
                         let old = self.pt.pop().unwrap();
                         if old != PageState::Uninitialized {
-                            error!(
-                                "expected previous page state to be uninitialized"
-                            );
+                            error!("expected previous page state to be uninitialized");
                             return Err(Error::corruption(None));
                         }
                     }
@@ -228,25 +205,6 @@ impl Snapshot {
 
         Ok(())
     }
-
-    fn filter_inner_heap_ids(&mut self) {
-        for page in &mut self.pt {
-            match page {
-                PageState::Free(_lsn, ref mut ptr) => {
-                    ptr.forget_heap_log_coordinates()
-                }
-                PageState::Present { ref mut base, ref mut frags } => {
-                    base.1.forget_heap_log_coordinates();
-                    for (_, ref mut ptr) in frags {
-                        ptr.forget_heap_log_coordinates();
-                    }
-                }
-                PageState::Uninitialized => {
-                    unreachable!()
-                }
-            }
-        }
-    }
 }
 
 fn advance_snapshot(
@@ -254,14 +212,13 @@ fn advance_snapshot(
     mut snapshot: Snapshot,
     config: &RunningConfig,
 ) -> Result<Snapshot> {
-    #[cfg(feature = "metrics")]
     let _measure = Measure::new(&M.advance_snapshot);
 
     trace!("building on top of old snapshot: {:?}", snapshot);
 
     let old_stable_lsn = snapshot.stable_lsn;
 
-    for (log_kind, pid, lsn, ptr) in &mut iter {
+    while let Some((log_kind, pid, lsn, ptr, sz)) = iter.next() {
         trace!(
             "in advance_snapshot looking at item with pid {} lsn {} ptr {}",
             pid,
@@ -281,7 +238,12 @@ fn advance_snapshot(
             continue;
         }
 
-        snapshot.apply(log_kind, pid, lsn, ptr)?;
+        if lsn >= iter.max_lsn.unwrap() {
+            error!("lsn {} >= iter max_lsn {}", lsn, iter.max_lsn.unwrap());
+            return Err(Error::corruption(None));
+        }
+
+        snapshot.apply(log_kind, pid, lsn, ptr, sz)?;
     }
 
     // `snapshot.tip_lid` can be set based on 4 possibilities for the tip of the
@@ -297,7 +259,7 @@ fn advance_snapshot(
     //    that point without allocating a new segment
     // 4. the recovered tip is at the beginning of a new segment, but without
     //    any valid messages in it yet. treat as #3 above, but also take care
-    //    in the SA initialization to properly initialize any segment tracking
+    //    in te SA initialization to properly initialize any segment tracking
     //    state despite not having any pages currently residing there.
 
     let no_recovery_progress = iter.cur_lsn.is_none()
@@ -307,17 +269,19 @@ fn advance_snapshot(
     #[cfg(feature = "testing")]
     let mut shred_point = None;
 
-    if db_is_empty {
+    let snapshot = if db_is_empty {
         trace!("db is empty, returning default snapshot");
         if snapshot != Snapshot::default() {
             error!("expected snapshot to be Snapshot::default");
             return Err(Error::corruption(None));
         }
+        snapshot
     } else if iter.cur_lsn.is_none() {
         trace!(
             "no recovery progress happened since the last snapshot \
             was generated, returning the previous one"
         );
+        snapshot
     } else {
         let iterated_lsn = iter.cur_lsn.unwrap();
 
@@ -330,9 +294,9 @@ fn advance_snapshot(
         let monotonic = segment_progress >= SEG_HEADER_LEN as Lsn
             || (segment_progress == 0 && iter.segment_base.is_none());
         if !monotonic {
-            error!(
-                "expected segment progress {} to be above SEG_HEADER_LEN or == 0, cur_lsn: {}",
-                segment_progress, iterated_lsn,
+            error!("expected segment progress {} to be above SEG_HEADER_LEN or == 0, cur_lsn: {}",
+                segment_progress,
+                iterated_lsn,
             );
             return Err(Error::corruption(None));
         }
@@ -385,7 +349,8 @@ fn advance_snapshot(
 
         snapshot.stable_lsn = Some(stable_lsn);
         snapshot.active_segment = active_segment;
-        snapshot.filter_inner_heap_ids();
+
+        snapshot
     };
 
     trace!("generated snapshot: {:?}", snapshot);
@@ -401,16 +366,12 @@ fn advance_snapshot(
 
     #[cfg(feature = "testing")]
     let reverse_segments = {
+        use std::collections::{HashMap, HashSet};
         let shred_base = shred_point.unwrap_or(LogOffset::max_value());
-        let mut reverse_segments = Map::new();
+        let mut reverse_segments = HashMap::new();
         for (pid, page) in snapshot.pt.iter().enumerate() {
             let offsets = page.offsets();
-            for offset_option in offsets {
-                let offset = if let Some(offset) = offset_option {
-                    offset
-                } else {
-                    continue;
-                };
+            for offset in offsets {
                 let segment = config.normalize(offset);
                 if segment == config.normalize(shred_base) {
                     assert!(
@@ -423,8 +384,9 @@ fn advance_snapshot(
                         shred_base
                     );
                 }
-                let entry =
-                    reverse_segments.entry(segment).or_insert_with(Set::new);
+                let entry = reverse_segments
+                    .entry(segment)
+                    .or_insert_with(HashSet::new);
                 entry.insert((pid, offset));
             }
         }
@@ -463,6 +425,11 @@ fn advance_snapshot(
         }
     }
 
+    // remove all blob files larger than our stable offset
+    if let Some(stable_lsn) = snapshot.stable_lsn {
+        gc_blobs(config, stable_lsn)?;
+    }
+
     #[cfg(feature = "event_log")]
     config.event_log.recovered_lsn(snapshot.stable_lsn.unwrap_or(0));
 
@@ -474,7 +441,7 @@ fn advance_snapshot(
 pub fn read_snapshot_or_default(config: &RunningConfig) -> Result<Snapshot> {
     // NB we want to error out if the read snapshot was corrupted.
     // We only use a default Snapshot when there is no snapshot found.
-    let last_snap = read_snapshot(config)?.unwrap_or_default();
+    let last_snap = read_snapshot(config)?.unwrap_or_else(Snapshot::default);
 
     let log_iter =
         raw_segment_iter_from(last_snap.stable_lsn.unwrap_or(0), config)?;
@@ -503,7 +470,7 @@ fn read_snapshot(config: &RunningConfig) -> Result<Option<Snapshot>> {
     let _read = f.read_to_end(&mut buf)?;
     let len = buf.len();
     if len <= 12 {
-        warn!("empty/corrupt snapshot file found at path: {:?}", path);
+        warn!("empty/corrupt snapshot file found");
         return Err(Error::corruption(None));
     }
 
@@ -519,27 +486,46 @@ fn read_snapshot(config: &RunningConfig) -> Result<Option<Snapshot>> {
     let crc_actual = crc32(&buf);
 
     if crc_expected != crc_actual {
-        warn!(
-            "corrupt snapshot file found, crc does not match expected. \
-            path: {:?}",
-            path
-        );
+        warn!("corrupt snapshot file found, crc does not match expected");
         return Err(Error::corruption(None));
     }
 
-    Snapshot::deserialize(&mut buf.as_slice()).map(Some)
+    #[cfg(feature = "zstd")]
+    let bytes = if config.use_compression {
+        use std::convert::TryInto;
+
+        let len_expected: u64 =
+            u64::from_le_bytes(len_expected_bytes.as_ref().try_into().unwrap());
+
+        decompress(&*buf, usize::try_from(len_expected).unwrap()).unwrap()
+    } else {
+        buf
+    };
+
+    #[cfg(not(feature = "zstd"))]
+    let bytes = buf;
+
+    Snapshot::deserialize(&mut bytes.as_slice()).map(Some)
 }
 
-pub(in crate::pagecache) fn write_snapshot(
-    config: &RunningConfig,
-    snapshot: &Snapshot,
-) -> Result<()> {
+fn write_snapshot(config: &RunningConfig, snapshot: &Snapshot) -> Result<()> {
     trace!("writing snapshot {:?}", snapshot);
 
-    let bytes = snapshot.serialize();
+    let raw_bytes = snapshot.serialize();
+    let decompressed_len = raw_bytes.len();
+
+    #[cfg(feature = "zstd")]
+    let bytes = if config.use_compression {
+        compress(&*raw_bytes, config.compression_factor).unwrap()
+    } else {
+        raw_bytes
+    };
+
+    #[cfg(not(feature = "zstd"))]
+    let bytes = raw_bytes;
 
     let crc32: [u8; 4] = u32_to_arr(crc32(&bytes));
-    let len_bytes: [u8; 8] = u64_to_arr(bytes.len() as u64);
+    let len_bytes: [u8; 8] = u64_to_arr(decompressed_len as u64);
 
     let path_1_suffix =
         format!("snap.{:016X}.generating", snapshot.stable_lsn.unwrap_or(0));
@@ -572,8 +558,6 @@ pub(in crate::pagecache) fn write_snapshot(
 
     io_fail!(config, "snap write mv");
     std::fs::rename(&path_1, &path_2)?;
-    io_fail!(config, "snap write dir fsync");
-    maybe_fsync_directory(config.get_path())?;
     io_fail!(config, "snap write mv post");
 
     trace!("renamed snapshot to {}", path_2.to_string_lossy());
@@ -582,7 +566,7 @@ pub(in crate::pagecache) fn write_snapshot(
     let candidates = config.get_snapshot_files()?;
     for path in candidates {
         let path_str = path.file_name().unwrap().to_str().unwrap();
-        if !path_2.to_string_lossy().ends_with(path_str) {
+        if !path_2.to_string_lossy().ends_with(&*path_str) {
             debug!("removing old snapshot file {:?}", path);
 
             io_fail!(config, "snap write rm old");

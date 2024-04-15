@@ -57,17 +57,11 @@ where
             }
         }
 
-        // We want to keep looping as long as it returns true,
-        // so we don't need any explicit conversion here.
-        while self
-            .init_mu
-            .compare_exchange(false, true, SeqCst, SeqCst)
-            .is_err()
-        {
-            // `hint::spin_loop` requires Rust 1.49.
-            #[allow(deprecated)]
-            std::sync::atomic::spin_loop_hint();
-        }
+        // compare_and_swap returns the last value on success,
+        // or the current value on failure. We want to keep
+        // looping as long as it returns true, so we don't need
+        // any explicit conversion here.
+        while self.init_mu.compare_exchange(false, true, SeqCst, SeqCst).is_err() {}
 
         {
             let value_ptr = self.value.load(Acquire);

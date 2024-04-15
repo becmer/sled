@@ -1,11 +1,11 @@
-//! `sled` is an embedded database with
+//! `sled` is a high-performance embedded database with
 //! an API that is similar to a `BTreeMap<[u8], [u8]>`,
 //! but with several additional capabilities for
 //! assisting creators of stateful systems.
 //!
 //! It is fully thread-safe, and all operations are
-//! atomic. Most are fully non-blocking. Multiple
-//! `Tree`s with isolated keyspaces are supported with the
+//! atomic. Multiple `Tree`s with isolated keyspaces
+//! are supported with the
 //! [`Db::open_tree`](struct.Db.html#method.open_tree) method.
 //!
 //! ACID transactions involving reads and writes to
@@ -81,29 +81,29 @@
 //! # let _ = std::fs::remove_dir_all("my_db");
 //! ```
 #![doc(
-    html_logo_url = "https://raw.githubusercontent.com/spacejam/sled/main/art/tree_face_anti-transphobia.png"
+    html_logo_url = "https://raw.githubusercontent.com/spacejam/sled/master/art/tree_face_anti-transphobia.png"
 )]
-#![cfg_attr(
-    feature = "for-internal-testing-only",
-    deny(
-        missing_docs,
-        future_incompatible,
-        nonstandard_style,
-        rust_2018_idioms,
-        missing_copy_implementations,
-        trivial_casts,
-        trivial_numeric_casts,
-        unsafe_code,
-        unused_qualifications,
-    )
+#![deny(
+    missing_docs,
+    future_incompatible,
+    nonstandard_style,
+    rust_2018_idioms,
+    missing_copy_implementations,
+    trivial_casts,
+    trivial_numeric_casts,
+    unsafe_code,
+    unused_qualifications,
+    unused_imports,
+    deprecated,
 )]
-#![cfg_attr(feature = "for-internal-testing-only", deny(
+#![deny(
     // over time, consider enabling the commented-out lints below
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
+    clippy::checked_conversions,
     clippy::decimal_literal_representation,
     clippy::doc_markdown,
     // clippy::else_if_without_else,
@@ -112,7 +112,9 @@
     clippy::explicit_iter_loop,
     clippy::expl_impl_clone_on_copy,
     clippy::fallible_impl_from,
+    clippy::filter_map,
     clippy::filter_map_next,
+    clippy::find_map,
     clippy::float_arithmetic,
     clippy::get_unwrap,
     clippy::if_not_else,
@@ -121,13 +123,12 @@
     //clippy::integer_arithmetic,
     clippy::invalid_upcast_comparisons,
     clippy::items_after_statements,
-    clippy::manual_find_map,
     clippy::map_entry,
     clippy::map_flatten,
-    clippy::match_like_matches_macro,
     clippy::match_same_arms,
     clippy::maybe_infinite_iter,
     clippy::mem_forget,
+    // clippy::missing_const_for_fn,
     // clippy::missing_docs_in_private_items,
     clippy::module_name_repetitions,
     clippy::multiple_inherent_impl,
@@ -138,8 +139,9 @@
     clippy::non_ascii_literal,
     clippy::path_buf_push_overwrite,
     clippy::print_stdout,
+    clippy::pub_enum_variant_names,
     clippy::redundant_closure_for_method_calls,
-    // clippy::shadow_reuse,
+    clippy::shadow_reuse,
     clippy::shadow_same,
     clippy::shadow_unrelated,
     clippy::single_match_else,
@@ -151,16 +153,12 @@
     clippy::unseparated_literal_suffix,
     clippy::used_underscore_binding,
     clippy::wildcard_dependencies,
-))]
-#![cfg_attr(
-    feature = "for-internal-testing-only",
-    warn(
-        clippy::missing_const_for_fn,
-        clippy::multiple_crate_versions,
-        // clippy::wildcard_enum_match_arm,
-    )
+    // clippy::wildcard_enum_match_arm,
+    clippy::wrong_pub_self_convention,
 )]
-#![allow(clippy::comparison_chain)]
+#![warn(clippy::multiple_crate_versions)]
+#![allow(clippy::mem_replace_with_default)] // Not using std::mem::take() due to MSRV of 1.37 (intro'd in 1.40)
+#![allow(clippy::match_like_matches_macro)] // Not using std::matches! due to MSRV of 1.37 (intro'd in 1.42)
 
 macro_rules! io_fail {
     ($config:expr, $e:expr) => {
@@ -177,44 +175,40 @@ macro_rules! io_fail {
 
 macro_rules! testing_assert {
     ($($e:expr),*) => {
-        #[cfg(feature = "for-internal-testing-only")]
+        #[cfg(feature = "lock_free_delays")]
         assert!($($e),*)
     };
 }
 
+mod arc;
 mod atomic_shim;
-mod backoff;
 mod batch;
-mod cache_padded;
+mod binary_search;
 mod concurrency_control;
 mod config;
 mod context;
 mod db;
 mod dll;
-mod ebr;
 mod fastcmp;
 mod fastlock;
-mod fnv;
 mod histogram;
 mod iter;
 mod ivec;
 mod lazy;
 mod lru;
 mod meta;
-#[cfg(feature = "metrics")]
 mod metrics;
 mod node;
 mod oneshot;
 mod pagecache;
+mod prefix;
 mod result;
 mod serialization;
 mod stack;
 mod subscriber;
 mod sys_limits;
-mod threadpool;
 pub mod transaction;
 mod tree;
-mod varint;
 
 /// Functionality for conditionally triggering failpoints under test.
 #[cfg(feature = "failpoints")]
@@ -223,60 +217,100 @@ pub mod fail;
 #[cfg(feature = "docs")]
 pub mod doc;
 
-#[cfg(not(miri))]
+#[cfg(any(
+    miri,
+    not(any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    ))
+))]
+mod threadpool {
+    use super::{OneShot, Result};
+
+    /// Just execute a task without involving threads.
+    pub fn spawn<F, R>(work: F) -> Result<OneShot<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (promise_filler, promise) = OneShot::pair();
+        promise_filler.fill((work)());
+        Ok(promise)
+    }
+}
+
+#[cfg(all(
+    not(miri),
+    any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    )
+))]
+mod threadpool;
+
+#[cfg(all(
+    not(miri),
+    any(
+        windows,
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    )
+))]
 mod flusher;
 
 #[cfg(feature = "event_log")]
 /// The event log helps debug concurrency issues.
 pub mod event_log;
 
-/// Opens a `Db` with a default configuration at the
-/// specified path. This will create a new storage
-/// directory at the specified path if it does
-/// not already exist. You can use the `Db::was_recovered`
-/// method to determine if your database was recovered
-/// from a previous instance. You can use `Config::create_new`
-/// if you want to increase the chances that the database
-/// will be freshly created.
-pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Db> {
-    Config::new().path(path).open()
-}
+#[cfg(feature = "measure_allocs")]
+mod measure_allocs;
 
-/// Print a performance profile to standard out
-/// detailing what the internals of the system are doing.
-///
-/// Requires the `metrics` feature to be enabled,
-/// which may introduce a bit of memory and overall
-/// performance overhead as lots of metrics are
-/// tallied up. Nevertheless, it is a useful
-/// tool for quickly understanding the root of
-/// a performance problem, and it can be invaluable
-/// for including in any opened issues.
-#[cfg(feature = "metrics")]
-#[allow(clippy::print_stdout)]
-pub fn print_profile() {
-    println!("{}", M.format_profile());
-}
+#[cfg(feature = "measure_allocs")]
+#[global_allocator]
+static ALLOCATOR: measure_allocs::TrackingAllocator =
+    measure_allocs::TrackingAllocator;
+
+const DEFAULT_TREE_ID: &[u8] = b"__sled__default";
 
 /// hidden re-export of items for testing purposes
 #[doc(hidden)]
-pub use self::{
-    config::RunningConfig,
-    lazy::Lazy,
-    pagecache::{
-        constants::{
-            MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION, SEG_HEADER_LEN,
+pub use {
+    self::{
+        config::RunningConfig,
+        lazy::Lazy,
+        pagecache::{
+            constants::{
+                MAX_MSG_HEADER_LEN, MAX_SPACE_AMPLIFICATION,
+                MINIMUM_ITEMS_PER_SEGMENT, SEG_HEADER_LEN,
+            },
+            BatchManifest, DiskPtr, Log, LogKind, LogOffset, LogRead, Lsn,
+            PageCache, PageId,
         },
-        BatchManifest, DiskPtr, Log, LogKind, LogOffset, LogRead, Lsn,
-        PageCache, PageId,
+        serialization::Serialize,
     },
-    serialization::Serialize,
+    crossbeam_epoch::{
+        pin as crossbeam_pin, Atomic, Guard as CrossbeamGuard, Owned, Shared,
+    },
 };
 
 pub use self::{
     batch::Batch,
     config::{Config, Mode},
-    db::Db,
+    db::{open, Db},
     iter::Iter,
     ivec::IVec,
     result::{Error, Result},
@@ -285,58 +319,50 @@ pub use self::{
     tree::{CompareAndSwapError, Tree},
 };
 
-#[cfg(feature = "metrics")]
-use self::{
-    histogram::Histogram,
-    metrics::{clock, Measure, M},
-};
-
 use {
     self::{
+        arc::Arc,
         atomic_shim::{AtomicI64 as AtomicLsn, AtomicU64},
-        backoff::Backoff,
-        cache_padded::CachePadded,
+        binary_search::binary_search_lub,
         concurrency_control::Protector,
         context::Context,
-        ebr::{
-            pin as crossbeam_pin, Atomic, Guard as CrossbeamGuard, Owned,
-            Shared,
-        },
         fastcmp::fastcmp,
+        histogram::Histogram,
         lru::Lru,
         meta::Meta,
-        node::Node,
+        metrics::{clock, Measure, M},
+        node::{Data, Node},
         oneshot::{OneShot, OneShotFiller},
         result::CasResult,
         subscriber::Subscribers,
         tree::TreeInner,
     },
+    crossbeam_utils::{Backoff, CachePadded},
     log::{debug, error, trace, warn},
-    pagecache::{constants::MAX_BLOB, RecoveryGuard},
+    pagecache::RecoveryGuard,
     parking_lot::{Condvar, Mutex, RwLock},
     std::{
         collections::BTreeMap,
         convert::TryFrom,
         fmt::{self, Debug},
         io::{Read, Write},
-        sync::{
-            atomic::{
-                AtomicUsize,
-                Ordering::{Acquire, Relaxed, Release, SeqCst},
-            },
-            Arc,
+        sync::atomic::{
+            AtomicUsize,
+            Ordering::{Acquire, Release, SeqCst},
         },
     },
 };
 
 #[doc(hidden)]
 pub fn pin() -> Guard {
-    Guard { inner: crossbeam_pin() }
+    Guard { inner: crossbeam_pin(), readset: vec![], writeset: vec![] }
 }
 
 #[doc(hidden)]
 pub struct Guard {
     inner: CrossbeamGuard,
+    readset: Vec<PageId>,
+    writeset: Vec<PageId>,
 }
 
 impl std::ops::Deref for Guard {
@@ -359,11 +385,6 @@ fn crc32(buf: &[u8]) -> u32 {
 }
 
 fn calculate_message_crc32(header: &[u8], body: &[u8]) -> u32 {
-    trace!(
-        "calculating crc32 for header len {} body len {}",
-        header.len(),
-        body.len()
-    );
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(body);
     hasher.update(&header[4..]);
@@ -389,9 +410,9 @@ const fn debug_delay() {}
 pub(crate) enum Link {
     /// A new value is set for a given key
     Set(IVec, IVec),
-    /// The kv pair at a particular index is removed
+    /// The associated value is removed for a given key
     Del(IVec),
-    /// A child of this Index node is marked as mergeable
+    /// A child of this Index node is marked as mergable
     ParentMergeIntention(PageId),
     /// The merging child has been completely merged into its left sibling
     ParentMergeConfirm,
@@ -401,29 +422,18 @@ pub(crate) enum Link {
 
 /// A fast map that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
-#[cfg(not(feature = "for-internal-testing-only"))]
-pub(crate) type FastMap8<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<fnv::Hasher>>;
-
-#[cfg(feature = "for-internal-testing-only")]
-pub(crate) type FastMap8<K, V> = BTreeMap<K, V>;
+pub(crate) type FastMap8<K, V> = std::collections::HashMap<
+    K,
+    V,
+    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
+>;
 
 /// A fast set that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
-#[cfg(not(feature = "for-internal-testing-only"))]
-pub(crate) type FastSet8<V> =
-    std::collections::HashSet<V, std::hash::BuildHasherDefault<fnv::Hasher>>;
-
-#[cfg(feature = "for-internal-testing-only")]
-pub(crate) type FastSet8<V> = std::collections::BTreeSet<V>;
-
-#[cfg(not(feature = "for-internal-testing-only"))]
-use std::collections::HashMap as Map;
-
-// we avoid HashMap while testing because
-// it makes tests non-deterministic
-#[cfg(feature = "for-internal-testing-only")]
-use std::collections::{BTreeMap as Map, BTreeSet as Set};
+pub(crate) type FastSet8<V> = std::collections::HashSet<
+    V,
+    std::hash::BuildHasherDefault<fxhash::FxHasher64>,
+>;
 
 /// A function that may be configured on a particular shared `Tree`
 /// that will be applied as a kind of read-modify-write operator
@@ -486,11 +496,11 @@ use std::collections::{BTreeMap as Map, BTreeSet as Set};
 /// # Ok(()) }
 /// ```
 pub trait MergeOperator:
-    Send + Sync + Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
+    Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
 {
 }
 impl<F> MergeOperator for F where
-    F: Send + Sync + Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
+    F: Fn(&[u8], Option<&[u8]>, &[u8]) -> Option<Vec<u8>>
 {
 }
 
@@ -498,36 +508,22 @@ mod compile_time_assertions {
     use crate::*;
 
     #[allow(unreachable_code)]
-    const fn _assert_public_types_send_sync() {
-        _assert_send::<Subscriber>();
+    fn _assert_public_types_send_sync() {
+        _assert_send::<Subscriber>(unreachable!());
 
-        _assert_send_sync::<Iter>();
-        _assert_send_sync::<Tree>();
-        _assert_send_sync::<Db>();
-        _assert_send_sync::<Batch>();
-        _assert_send_sync::<IVec>();
-        _assert_send_sync::<Config>();
-        _assert_send_sync::<CompareAndSwapError>();
-        _assert_send_sync::<Error>();
-        _assert_send_sync::<Event>();
-        _assert_send_sync::<Mode>();
+        _assert_send_sync::<Iter>(unreachable!());
+        _assert_send_sync::<Tree>(unreachable!());
+        _assert_send_sync::<Db>(unreachable!());
+        _assert_send_sync::<Batch>(unreachable!());
+        _assert_send_sync::<IVec>(unreachable!());
+        _assert_send_sync::<Config>(unreachable!());
+        _assert_send_sync::<CompareAndSwapError>(unreachable!());
+        _assert_send_sync::<Error>(unreachable!());
+        _assert_send_sync::<Event>(unreachable!());
+        _assert_send_sync::<Mode>(unreachable!());
     }
 
-    const fn _assert_send<S: Send>() {}
+    fn _assert_send<S: Send>(_: &S) {}
 
-    const fn _assert_send_sync<S: Send + Sync>() {}
-}
-
-#[cfg(all(unix, not(miri)))]
-fn maybe_fsync_directory<P: AsRef<std::path::Path>>(
-    path: P,
-) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(any(not(unix), miri))]
-fn maybe_fsync_directory<P: AsRef<std::path::Path>>(
-    _: P,
-) -> std::io::Result<()> {
-    Ok(())
+    fn _assert_send_sync<S: Send + Sync>(_: &S) {}
 }

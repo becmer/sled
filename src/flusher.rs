@@ -1,8 +1,6 @@
 use std::thread;
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
-
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +24,7 @@ impl ShutdownState {
 pub(crate) struct Flusher {
     shutdown: Arc<Mutex<ShutdownState>>,
     sc: Arc<Condvar>,
-    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    join_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Flusher {

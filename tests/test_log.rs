@@ -4,10 +4,6 @@ use rand::{thread_rng, Rng};
 
 use sled::*;
 
-use sled::{
-    pin, BatchManifest, Log, LogKind, LogRead, Lsn, PageId, SEG_HEADER_LEN,
-};
-
 const PID: PageId = 4;
 const REPLACE: LogKind = LogKind::Replace;
 
